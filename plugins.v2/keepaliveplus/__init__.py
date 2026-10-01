@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.2.2"
+    plugin_version = "0.2.3"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -812,20 +812,23 @@ class KeepAlivePlus(_PluginBase):
 
     _kap_orig_parse: Any = None
     _kap_orig_search: Any = None
+    _kap_orig_search_async: Any = None
 
     def _install_combined_sort_patch(self):
-        """组合排序补丁：包装 SearchChain.async_search_by_id，返回前按
-        「站点优先级(pri=下载缺口)升序 + 站内做种数降序」排序——
+        """组合排序补丁：包装 SearchChain 的 __search_all_sites / __async_search_all_sites
+        (所有搜索路径——实时流式、精确搜索、订阅——的统一数据源)，返回前按
+        「站点优先级(pri=下载缺口)升序 + 站内做种数降序」排序。
         前端"默认"排序(保持后端顺序)即为保号优选组合排序。升级后插件重载自动重打。"""
         try:
             from app.chain.search.facade import SearchChain
-            orig = SearchChain.async_search_by_id
-            if getattr(orig, "_kap_sorted", False):
+            attr_sync = "_SearchChain__search_all_sites"
+            attr_async = "_SearchChain__async_search_all_sites"
+            if getattr(getattr(SearchChain, attr_sync, None), "_kap_sorted", False):
                 return
-            KeepAlivePlus._kap_orig_search = orig
+            KeepAlivePlus._kap_orig_search = getattr(SearchChain, attr_sync, None)
+            KeepAlivePlus._kap_orig_search_async = getattr(SearchChain, attr_async, None)
 
-            async def patched(*args, **kwargs):
-                torrents = await orig(*args, **kwargs)
+            def _sort_torrents(torrents):
                 try:
                     torrents.sort(key=lambda t: (
                         (t.site_order if t.site_order is not None else 9999),
@@ -835,21 +838,40 @@ class KeepAlivePlus(_PluginBase):
                     pass
                 return torrents
 
-            patched._kap_sorted = True
-            SearchChain.async_search_by_id = patched
-            logger.info("%s 组合排序补丁已安装(站点优先级+站内做种数)", self.plugin_name)
+            installed = False
+            if KeepAlivePlus._kap_orig_search is not None:
+                def patched_sync(self, *args, **kwargs):
+                    return _sort_torrents(KeepAlivePlus._kap_orig_search(self, *args, **kwargs))
+                patched_sync._kap_sorted = True
+                setattr(SearchChain, attr_sync, patched_sync)
+                installed = True
+            if KeepAlivePlus._kap_orig_search_async is not None:
+                async def patched_async(self, *args, **kwargs):
+                    return _sort_torrents(await KeepAlivePlus._kap_orig_search_async(self, *args, **kwargs))
+                patched_async._kap_sorted = True
+                setattr(SearchChain, attr_async, patched_async)
+                installed = True
+            if installed:
+                logger.info("%s 组合排序补丁已安装(站点优先级+站内做种数,覆盖全部搜索路径)", self.plugin_name)
         except Exception as err:
             logger.error("%s 组合排序补丁安装失败：%s", self.plugin_name, err)
 
     def _uninstall_combined_sort_patch(self):
-        orig = KeepAlivePlus._kap_orig_search
-        if orig is None:
-            return
         try:
             from app.chain.search.facade import SearchChain
-            SearchChain.async_search_by_id = orig
-            KeepAlivePlus._kap_orig_search = None
-            logger.info("%s 组合排序补丁已卸载", self.plugin_name)
+            attr_sync = "_SearchChain__search_all_sites"
+            attr_async = "_SearchChain__async_search_all_sites"
+            restored = False
+            if KeepAlivePlus._kap_orig_search is not None:
+                setattr(SearchChain, attr_sync, KeepAlivePlus._kap_orig_search)
+                KeepAlivePlus._kap_orig_search = None
+                restored = True
+            if KeepAlivePlus._kap_orig_search_async is not None:
+                setattr(SearchChain, attr_async, KeepAlivePlus._kap_orig_search_async)
+                KeepAlivePlus._kap_orig_search_async = None
+                restored = True
+            if restored:
+                logger.info("%s 组合排序补丁已卸载", self.plugin_name)
         except Exception as err:
             logger.error("%s 组合排序补丁卸载失败：%s", self.plugin_name, err)
 
