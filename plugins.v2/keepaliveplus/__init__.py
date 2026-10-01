@@ -473,7 +473,7 @@ class KeepAlivePlus(_PluginBase):
 
         r1, r2 = _remain(days1), _remain(days2)
         if r1 is not None and action:
-            txt = "⚠️ 距%s红线约%d天(未封存)" % (action, r1)
+            txt = "距%s红线约%d天(未封存)" % (action, r1)
             if r2 is not None:
                 txt += "/约%d天(封存)" % r2
             if lag > 0:
@@ -558,8 +558,6 @@ class KeepAlivePlus(_PluginBase):
                         note += "。⚠️ " + risk_txt
                 elif cur_id >= ret_id:
                     status, note = "✅ 已保号", "已达豁免等级「%s」" % ret_name
-                    if (rule or {}).get("risk_exempt_mode") == "seal":
-                        note += "(豁免需封存账号后生效)"
                     if risk_txt:
                         note += "。⚠️ " + risk_txt
                 else:
