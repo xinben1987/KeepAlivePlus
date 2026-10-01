@@ -411,9 +411,13 @@ class KeepAlivePlus(_PluginBase):
 
     @staticmethod
     def _size_gb(s) -> Optional[float]:
-        """解析 '512G'/'120GB'/'1T'/'1.5TB'/'25000G' 为 GB 数。"""
-        if not s:
+        """解析 '512G'/'120GB'/'1T'/'1.5TB'/纯数字(字节或GB) 为 GB 数。"""
+        if s is None:
             return None
+        if isinstance(s, (int, float)):
+            v = float(s)
+            # 大于 2^30 视为字节数，否则视为 GB 数
+            return v / (1 << 30) if v > (1 << 30) else v
         m = re.match(r"([\d.]+)\s*([TGMK]?)(?:I?B)?$", str(s).strip().upper())
         if not m:
             return None
