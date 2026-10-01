@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.7"
+    plugin_version = "0.1.8"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -70,6 +70,10 @@ class KeepAlivePlus(_PluginBase):
     )
     SUB_PATTERNS = [".zh.srt"]
     VIDEO_EXTS = [".mkv", ".mp4", ".ts", ".avi", ".m2ts"]
+    # 无条件永久保留关键词（不含封存前提才算真保号）
+    PERMANENT_KW = ["永远保留", "永遠保留", "永久保留", "永久不删除", "永久不刪除", "不会因不活跃", "不會因不活躍", "永远不会被删号", "永遠不會被刪號"]
+    # 封存/挂起类前提词
+    SEAL_KW = ["封存", "挂起", "掛起", "Park", "park"]
 
     def __init__(self):
         super().__init__()
@@ -355,15 +359,24 @@ class KeepAlivePlus(_PluginBase):
                         continue
         return None
 
-    @staticmethod
-    def _is_retain_priv(priv: str) -> bool:
-        return any(kw in priv for kw in KeepAlivePlus.RETAIN_KEYWORDS)
-
-    def _retention_level(self, levels: List[Dict[str, Any]]):
+    def _permanent_level(self, levels: List[Dict[str, Any]]):
+        """无条件永久保留档：privilege 含永久/永远保留关键词且不含封存/挂起前提。"""
         best = None
         for lv in levels:
             priv = lv.get("privilege") or ""
-            if self._is_retain_priv(priv):
+            low = priv.lower()
+            if any(kw in priv for kw in self.PERMANENT_KW) and not any(kw in low for kw in self.SEAL_KW):
+                if best is None or int(lv.get("id", 0) or 0) < int(best.get("id", 0) or 0):
+                    best = lv
+        return best
+
+    def _seal_level(self, levels: List[Dict[str, Any]]):
+        """封存型保号档：达到该等级后封存账号可豁免（不计入无条件保号）。"""
+        best = None
+        for lv in levels:
+            priv = lv.get("privilege") or ""
+            low = priv.lower()
+            if any(kw in priv for kw in self.RETAIN_KEYWORDS) and any(kw in low for kw in self.SEAL_KW):
                 if best is None or int(lv.get("id", 0) or 0) < int(best.get("id", 0) or 0):
                     best = lv
         return best
@@ -535,7 +548,8 @@ class KeepAlivePlus(_PluginBase):
             rule = self._load_rule(site_name)
             levels = (rule or {}).get("levels", [])
             risk_txt = self._risk_text(rule, r)
-            ret_lv = self._retention_level(levels) if levels else None
+            perm_lv = self._permanent_level(levels) if levels else None
+            seal_lv = self._seal_level(levels) if levels else None
             cur_lv = self._match_level(levels, user_level) if levels else None
             donor = self._is_donor(site_name)
             if donor:
@@ -544,36 +558,44 @@ class KeepAlivePlus(_PluginBase):
                     note += "。⚠️ " + risk_txt
             elif not rule:
                 status, note = "ℹ️ 登录保号中", "无站点规则（每日自动登录已覆盖）"
-            elif ret_lv is None:
+            elif perm_lv is None and seal_lv is None:
                 status, note = "ℹ️ 登录保号中", "规则未定义保号豁免等级（每日自动登录已覆盖）"
                 if risk_txt:
                     note += "。⚠️ " + risk_txt
             else:
-                ret_id = int(ret_lv.get("id", 0) or 0)
+                # 判定基准=无条件永久保留档（封存型豁免不算已保号）
+                tgt_lv = perm_lv if perm_lv is not None else seal_lv
+                tgt_id = int(tgt_lv.get("id", 0) or 0)
+                tgt_name = tgt_lv.get("name") or "未配置"
                 cur_id = int(cur_lv.get("id", 0) or 0) if cur_lv else None
-                ret_name = ret_lv.get("name") or "未配置"
                 if cur_id is None:
                     status, note = "ℹ️ 登录保号中", "快照等级无法匹配规则等级表（每日自动登录已覆盖）"
                     if risk_txt:
                         note += "。⚠️ " + risk_txt
-                elif cur_id >= ret_id:
-                    status, note = "✅ 已保号", "已达豁免等级「%s」" % ret_name
+                elif perm_lv is not None and cur_id >= tgt_id:
+                    status, note = "✅ 已保号", "已达无条件永久保留档「%s」" % tgt_name
+                    if risk_txt:
+                        note += "。⚠️ " + risk_txt
+                elif perm_lv is None and cur_id >= tgt_id:
+                    status = "✅ 已达标（封存型）"
+                    note = "已达封存保号档「%s」：封存账号后豁免" % tgt_name
                     if risk_txt:
                         note += "。⚠️ " + risk_txt
                 else:
-                    gaps = self._gap_text(ret_lv, r)
-                    cond = self._cond_text(ret_lv)
+                    gaps = self._gap_text(tgt_lv, r)
+                    cond = self._cond_text(tgt_lv)
+                    tgt_label = "永久保留档" if perm_lv is not None else "封存可保档"
                     if gaps:
-                        note = "距豁免「%s」差 %d 级 | 实际差距：%s" % (ret_name, ret_id - cur_id, gaps)
+                        note = "距%s「%s」差 %d 级 | 实际差距：%s" % (tgt_label, tgt_name, tgt_id - cur_id, gaps)
                     else:
-                        note = "距豁免「%s」差 %d 级 | 需满足：%s" % (ret_name, ret_id - cur_id, cond or "见站点规则")
+                        note = "距%s「%s」差 %d 级 | 需满足：%s" % (tgt_label, tgt_name, tgt_id - cur_id, cond or "见站点规则")
                     if risk_txt:
                         note += "。⚠️ " + risk_txt
                     status = "⚠️ 未保号（登录保号中）"
             out.append({
                 "site": site_name, "domain": domain,
                 "user_level": user_level or "无快照",
-                "retention_level": (ret_lv or {}).get("name") or "未配置",
+                "retention_level": ((perm_lv or seal_lv) or {}).get("name") or "未配置",
                 "status": status, "note": note,
                 "updated": r.get("updated_time"),
                 "err_msg": r.get("err_msg"),
