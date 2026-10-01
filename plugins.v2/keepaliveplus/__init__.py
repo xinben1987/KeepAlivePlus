@@ -282,7 +282,6 @@ class KeepAlivePlus(_PluginBase):
     # ---------------- 数据与判定 ----------------
 
     @property
-    @property
     def rule_dirs(self) -> List[Path]:
         """所有存在的规则目录（自有目录优先）。"""
         return [Path(d) for d in self.RULES_DIRS if os.path.isdir(d)]
