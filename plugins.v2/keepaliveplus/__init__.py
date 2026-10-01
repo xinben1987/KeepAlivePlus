@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.2.4"
+    plugin_version = "0.3.0"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -736,9 +736,14 @@ class KeepAlivePlus(_PluginBase):
         return max(0.0, need_gb - cur)
 
     def _apply_search_priority(self):
-        """搜索优选：按下载缺口升序重排 site.pri(数字小=搜索结果靠前)。
+        """搜索优选:两件事。
 
-        首次启用时把原 pri 备份到 /config/keepaliveplus_pri_backup.json，
+        1. 按下载缺口升序重排 site.pri(排序引擎里 999-pri 越大=越靠前);
+        2. 默认排序引擎(sort_torrents)的规则 TorrentsPriority 改为
+           ["site","seeder"]——站点优先级优先 + 做种数降序,
+           搜索结果链(result.py)默认即保号优选排序,前端无需任何操作。
+
+        首次启用时备份原 pri 与 TorrentsPriority 到 /config/keepaliveplus_pri_backup.json,
         关闭功能时由 _restore_search_priority 还原。
         """
         if not self._has_calculated:
@@ -748,11 +753,25 @@ class KeepAlivePlus(_PluginBase):
             backup_file = Path("/config/keepaliveplus_pri_backup.json")
             con = sqlite3.connect("/config/user.db", timeout=15)
             con.row_factory = sqlite3.Row
-            if not backup_file.exists():
-                backup = {str(r["id"]): (r["pri"] or 0) for r in con.execute("select id, pri from site")}
-                backup_file.write_text(_json.dumps(backup, ensure_ascii=False), encoding="utf-8")
-                logger.info("%s 已备份原站点搜索优先级(%d 站)", self.plugin_name, len(backup))
-            # 域名 -> site id 映射（与快照同源的尾部匹配）
+            # 备份(兼容旧结构:纯 {id:pri})
+            backup = {"site_pri": {}, "torrents_priority": '["torrent", "upload", "seeder"]'}
+            if backup_file.exists():
+                try:
+                    old = _json.loads(backup_file.read_text(encoding="utf-8"))
+                    if "site_pri" in old:
+                        backup["site_pri"] = old.get("site_pri") or {}
+                        backup["torrents_priority"] = old.get("torrents_priority") or backup["torrents_priority"]
+                    else:
+                        backup["site_pri"] = old
+                except Exception:
+                    pass
+            if not backup["site_pri"]:
+                backup["site_pri"] = {str(r["id"]): (r["pri"] or 0) for r in con.execute("select id, pri from site")}
+            r = con.execute("select value from systemconfig where key='TorrentsPriority'").fetchone()
+            backup["torrents_priority"] = (r["value"] if r else None) or backup["torrents_priority"]
+            backup_file.write_text(_json.dumps(backup, ensure_ascii=False), encoding="utf-8")
+            logger.info("%s 已备份原站点优先级(%d 站)与排序规则", self.plugin_name, len(backup["site_pri"]))
+
             def _norm(d):
                 d = (d or "").lower().strip()
                 return d[4:] if d.startswith("www.") else d
@@ -764,7 +783,7 @@ class KeepAlivePlus(_PluginBase):
                     u = u.split("//", 1)[1]
                 u = u.split("/", 1)[0].strip()
                 if u:
-                    # 同一域名可能有多条站点记录（重复添加），全部收集
+                    # 同一域名可能有多条站点记录(重复添加),全部收集
                     site_map.setdefault(u, []).append(s["id"])
 
             def _match_ids(dom):
@@ -775,7 +794,7 @@ class KeepAlivePlus(_PluginBase):
                         ids.extend(sids)
                 return ids
 
-            # 排序：有缺口的站在前(缺口升序,缺得少的最优先)；缺口0(已保号)排后
+            # 排序:有缺口的站在前(缺口升序,缺得少的最优先);缺口0(已保号)排后
             items = []
             for o in self._cached_rows:
                 ids = _match_ids(o.get("domain") or "")
@@ -786,147 +805,36 @@ class KeepAlivePlus(_PluginBase):
             for sid, _ in items:
                 pri += 1
                 con.execute("update site set pri=? where id=?", (pri, sid))
+            # 默认排序引擎规则:站点优先级 + 做种数降序
+            con.execute("update systemconfig set value=? where key='TorrentsPriority'",
+                        ('["site","seeder"]',))
             con.commit()
             con.close()
-            logger.info("%s 搜索优选已重排站点优先级(共 %d 条,按下载缺口升序)", self.plugin_name, len(items))
+            logger.info("%s 搜索优选已生效:站点优先级重排 %d 条 + 排序规则[site,seeder]", self.plugin_name, len(items))
         except Exception as err:
-            logger.error("%s 搜索优选重排失败：%s", self.plugin_name, err)
+            logger.error("%s 搜索优选重排失败:%s", self.plugin_name, err)
 
     def _restore_search_priority(self):
-        """关闭搜索优选时还原备份的原站点优先级。"""
+        """关闭搜索优选时还原备份的原站点优先级与排序规则。"""
         backup_file = Path("/config/keepaliveplus_pri_backup.json")
         if not backup_file.exists():
             return
         try:
             import json as _json
-            backup = _json.loads(backup_file.read_text(encoding="utf-8"))
+            data = _json.loads(backup_file.read_text(encoding="utf-8"))
+            pri_map = data.get("site_pri") or data
             con = sqlite3.connect("/config/user.db", timeout=15)
-            for sid, pri in backup.items():
+            for sid, pri in pri_map.items():
                 con.execute("update site set pri=? where id=?", (int(pri), int(sid)))
+            tp = data.get("torrents_priority")
+            if tp:
+                con.execute("update systemconfig set value=? where key='TorrentsPriority'", (tp,))
             con.commit()
             con.close()
             backup_file.unlink()
-            logger.info("%s 已还原原站点搜索优先级(%d 站)", self.plugin_name, len(backup))
+            logger.info("%s 已还原原站点优先级与排序规则(%d 站)", self.plugin_name, len(pri_map))
         except Exception as err:
-            logger.error("%s 还原站点优先级失败：%s", self.plugin_name, err)
-
-    _kap_orig_parse: Any = None
-    _kap_orig_search: Any = None
-    _kap_orig_search_async: Any = None
-    _kap_orig_iter: Any = None
-
-    def _install_stream_sort_patch(self):
-        """流式事件重组补丁(终极方案)：包装 SearchProviderOwner._iter_torrent_events,
-        缓冲全部事件→全量 items 按「pri 升序+站内做种数降序」排序→重组事件流。
-        实时搜索的批次到达顺序不可控(并发),只有重组事件流才能让前端聚合顺序=组合排序。
-        异常时自动退回原始事件流,不影响搜索功能。"""
-        try:
-            from app.chain.search.provider import SearchProviderOwner
-            attr = "_iter_torrent_events"
-            orig = getattr(SearchProviderOwner, attr, None)
-            if orig is None:
-                logger.warning("%s 未找到事件流函数,流式排序补丁跳过", self.plugin_name)
-                return
-            if getattr(orig, "_kap_sorted", False):
-                return
-            KeepAlivePlus._kap_orig_iter = orig
-
-            async def patched_iter(self, **kwargs):
-                events = orig(self, **kwargs)
-                buffered = []
-                try:
-                    import contextlib
-                    async with contextlib.aclosing(events):
-                        async for ev in events:
-                            buffered.append(ev)
-                except Exception:
-                    for ev in buffered:
-                        yield ev
-                    return
-                try:
-                    all_items, first_items_ev, inserted = [], None, False
-                    for ev in buffered:
-                        if isinstance(ev, dict) and "items" in ev:
-                            if first_items_ev is None:
-                                first_items_ev = ev
-                            all_items.extend(ev.get("items") or [])
-                    if all_items:
-                        all_items.sort(key=lambda t: (
-                            (getattr(t, "site_order", None) if getattr(t, "site_order", None) is not None else 9999),
-                            -(getattr(t, "seeders", 0) or 0),
-                        ))
-                    for ev in buffered:
-                        if isinstance(ev, dict) and "items" in ev:
-                            if not inserted and first_items_ev is ev and all_items:
-                                yield {**ev, "items": list(all_items)}
-                                inserted = True
-                            continue
-                        yield ev
-                    if not inserted and all_items:
-                        yield {"items": list(all_items)}
-                except Exception:
-                    for ev in buffered:
-                        yield ev
-
-            patched_iter._kap_sorted = True
-            setattr(SearchProviderOwner, attr, patched_iter)
-            logger.info("%s 流式事件重组补丁已安装(组合排序)", self.plugin_name)
-        except Exception as err:
-            logger.error("%s 流式排序补丁安装失败：%s", self.plugin_name, err)
-
-    def _uninstall_stream_sort_patch(self):
-        orig = KeepAlivePlus._kap_orig_iter
-        if orig is None:
-            return
-        try:
-            from app.chain.search.provider import SearchProviderOwner
-            setattr(SearchProviderOwner, "_iter_torrent_events", orig)
-            KeepAlivePlus._kap_orig_iter = None
-            logger.info("%s 流式事件重组补丁已卸载", self.plugin_name)
-        except Exception as err:
-            logger.error("%s 流式排序补丁卸载失败：%s", self.plugin_name, err)
-
-    def _install_seeders_order_patch(self):
-        """安装站内做种数降序补丁：包装 IndexerModule.__parse_result，
-        使每个站的搜索结果按做种数降序返回——前端"站点"排序(稳定)即得到
-        「站点缺口优先 + 站内做种数降序」的组合排序。补丁随插件重载重打，升级免疫。"""
-        try:
-            from app.modules.indexer import IndexerModule
-            attr = "_IndexerModule__parse_result"
-            orig = getattr(IndexerModule, attr, None)
-            if orig is None:
-                logger.warning("%s 未找到搜索解析函数，做种数排序补丁跳过", self.plugin_name)
-                return
-            if getattr(orig, "_kap_seeded", False):
-                return
-            KeepAlivePlus._kap_orig_parse = orig
-
-            def patched(site, result_array, seconds, _orig=orig):
-                torrents = _orig(site, result_array, seconds)
-                try:
-                    torrents.sort(key=lambda t: -(getattr(t, "seeders", 0) or 0))
-                except Exception:
-                    pass
-                return torrents
-
-            patched._kap_seeded = True
-            setattr(IndexerModule, attr, staticmethod(patched))
-            logger.info("%s 站内做种数降序补丁已安装", self.plugin_name)
-        except Exception as err:
-            logger.error("%s 做种数排序补丁安装失败：%s", self.plugin_name, err)
-
-    def _uninstall_seeders_order_patch(self):
-        """卸载补丁，还原原解析函数。"""
-        orig = KeepAlivePlus._kap_orig_parse
-        if orig is None:
-            return
-        try:
-            from app.modules.indexer import IndexerModule
-            setattr(IndexerModule, "_IndexerModule__parse_result", staticmethod(orig))
-            KeepAlivePlus._kap_orig_parse = None
-            logger.info("%s 站内做种数降序补丁已卸载", self.plugin_name)
-        except Exception as err:
-            logger.error("%s 补丁卸载失败：%s", self.plugin_name, err)
+            logger.error("%s 还原站点优先级失败:%s", self.plugin_name, err)
 
     def _rows(self) -> List[Dict[str, Any]]:
         if not self._has_calculated:
