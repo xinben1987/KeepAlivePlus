@@ -771,13 +771,13 @@ class KeepAlivePlus(_PluginBase):
                         ids.extend(sids)
                 return ids
 
-            # 排序：缺口升序(缺得少的最优先)，缺口 0(已保号/无要求)排后
+            # 排序：有缺口的站在前(缺口升序,缺得少的最优先)；缺口0(已保号)排后
             items = []
             for o in self._cached_rows:
                 ids = _match_ids(o.get("domain") or "")
                 for sid in ids:
                     items.append((sid, float(o.get("gap_gb") or 0)))
-            items.sort(key=lambda x: (x[1], x[0]))
+            items.sort(key=lambda x: (x[1] <= 0, x[1], x[0]))
             pri = 0
             for sid, _ in items:
                 pri += 1
