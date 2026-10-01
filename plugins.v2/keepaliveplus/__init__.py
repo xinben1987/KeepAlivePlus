@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.2.3"
+    plugin_version = "0.2.4"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -102,11 +102,11 @@ class KeepAlivePlus(_PluginBase):
         if self._search_boost:
             self._apply_search_priority()
             self._install_seeders_order_patch()
-            self._install_combined_sort_patch()
+            self._install_stream_sort_patch()
         else:
             self._restore_search_priority()
             self._uninstall_seeders_order_patch()
-            self._uninstall_combined_sort_patch()
+            self._uninstall_stream_sort_patch()
 
     def __save_config(self):
         self.update_config({
@@ -813,67 +813,78 @@ class KeepAlivePlus(_PluginBase):
     _kap_orig_parse: Any = None
     _kap_orig_search: Any = None
     _kap_orig_search_async: Any = None
+    _kap_orig_iter: Any = None
 
-    def _install_combined_sort_patch(self):
-        """组合排序补丁：包装 SearchChain 的 __search_all_sites / __async_search_all_sites
-        (所有搜索路径——实时流式、精确搜索、订阅——的统一数据源)，返回前按
-        「站点优先级(pri=下载缺口)升序 + 站内做种数降序」排序。
-        前端"默认"排序(保持后端顺序)即为保号优选组合排序。升级后插件重载自动重打。"""
+    def _install_stream_sort_patch(self):
+        """流式事件重组补丁(终极方案)：包装 SearchProviderOwner._iter_torrent_events,
+        缓冲全部事件→全量 items 按「pri 升序+站内做种数降序」排序→重组事件流。
+        实时搜索的批次到达顺序不可控(并发),只有重组事件流才能让前端聚合顺序=组合排序。
+        异常时自动退回原始事件流,不影响搜索功能。"""
         try:
-            from app.chain.search.facade import SearchChain
-            attr_sync = "_SearchChain__search_all_sites"
-            attr_async = "_SearchChain__async_search_all_sites"
-            if getattr(getattr(SearchChain, attr_sync, None), "_kap_sorted", False):
+            from app.chain.search.provider import SearchProviderOwner
+            attr = "_iter_torrent_events"
+            orig = getattr(SearchProviderOwner, attr, None)
+            if orig is None:
+                logger.warning("%s 未找到事件流函数,流式排序补丁跳过", self.plugin_name)
                 return
-            KeepAlivePlus._kap_orig_search = getattr(SearchChain, attr_sync, None)
-            KeepAlivePlus._kap_orig_search_async = getattr(SearchChain, attr_async, None)
+            if getattr(orig, "_kap_sorted", False):
+                return
+            KeepAlivePlus._kap_orig_iter = orig
 
-            def _sort_torrents(torrents):
+            async def patched_iter(self, **kwargs):
+                events = orig(self, **kwargs)
+                buffered = []
                 try:
-                    torrents.sort(key=lambda t: (
-                        (t.site_order if t.site_order is not None else 9999),
-                        -(getattr(t, "seeders", 0) or 0),
-                    ))
+                    import contextlib
+                    async with contextlib.aclosing(events):
+                        async for ev in events:
+                            buffered.append(ev)
                 except Exception:
-                    pass
-                return torrents
+                    for ev in buffered:
+                        yield ev
+                    return
+                try:
+                    all_items, first_items_ev, inserted = [], None, False
+                    for ev in buffered:
+                        if isinstance(ev, dict) and "items" in ev:
+                            if first_items_ev is None:
+                                first_items_ev = ev
+                            all_items.extend(ev.get("items") or [])
+                    if all_items:
+                        all_items.sort(key=lambda t: (
+                            (getattr(t, "site_order", None) if getattr(t, "site_order", None) is not None else 9999),
+                            -(getattr(t, "seeders", 0) or 0),
+                        ))
+                    for ev in buffered:
+                        if isinstance(ev, dict) and "items" in ev:
+                            if not inserted and first_items_ev is ev and all_items:
+                                yield {**ev, "items": list(all_items)}
+                                inserted = True
+                            continue
+                        yield ev
+                    if not inserted and all_items:
+                        yield {"items": list(all_items)}
+                except Exception:
+                    for ev in buffered:
+                        yield ev
 
-            installed = False
-            if KeepAlivePlus._kap_orig_search is not None:
-                def patched_sync(self, *args, **kwargs):
-                    return _sort_torrents(KeepAlivePlus._kap_orig_search(self, *args, **kwargs))
-                patched_sync._kap_sorted = True
-                setattr(SearchChain, attr_sync, patched_sync)
-                installed = True
-            if KeepAlivePlus._kap_orig_search_async is not None:
-                async def patched_async(self, *args, **kwargs):
-                    return _sort_torrents(await KeepAlivePlus._kap_orig_search_async(self, *args, **kwargs))
-                patched_async._kap_sorted = True
-                setattr(SearchChain, attr_async, patched_async)
-                installed = True
-            if installed:
-                logger.info("%s 组合排序补丁已安装(站点优先级+站内做种数,覆盖全部搜索路径)", self.plugin_name)
+            patched_iter._kap_sorted = True
+            setattr(SearchProviderOwner, attr, patched_iter)
+            logger.info("%s 流式事件重组补丁已安装(组合排序)", self.plugin_name)
         except Exception as err:
-            logger.error("%s 组合排序补丁安装失败：%s", self.plugin_name, err)
+            logger.error("%s 流式排序补丁安装失败：%s", self.plugin_name, err)
 
-    def _uninstall_combined_sort_patch(self):
+    def _uninstall_stream_sort_patch(self):
+        orig = KeepAlivePlus._kap_orig_iter
+        if orig is None:
+            return
         try:
-            from app.chain.search.facade import SearchChain
-            attr_sync = "_SearchChain__search_all_sites"
-            attr_async = "_SearchChain__async_search_all_sites"
-            restored = False
-            if KeepAlivePlus._kap_orig_search is not None:
-                setattr(SearchChain, attr_sync, KeepAlivePlus._kap_orig_search)
-                KeepAlivePlus._kap_orig_search = None
-                restored = True
-            if KeepAlivePlus._kap_orig_search_async is not None:
-                setattr(SearchChain, attr_async, KeepAlivePlus._kap_orig_search_async)
-                KeepAlivePlus._kap_orig_search_async = None
-                restored = True
-            if restored:
-                logger.info("%s 组合排序补丁已卸载", self.plugin_name)
+            from app.chain.search.provider import SearchProviderOwner
+            setattr(SearchProviderOwner, "_iter_torrent_events", orig)
+            KeepAlivePlus._kap_orig_iter = None
+            logger.info("%s 流式事件重组补丁已卸载", self.plugin_name)
         except Exception as err:
-            logger.error("%s 组合排序补丁卸载失败：%s", self.plugin_name, err)
+            logger.error("%s 流式排序补丁卸载失败：%s", self.plugin_name, err)
 
     def _install_seeders_order_patch(self):
         """安装站内做种数降序补丁：包装 IndexerModule.__parse_result，
