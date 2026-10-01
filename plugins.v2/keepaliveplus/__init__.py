@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.2"
+    plugin_version = "0.1.3"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -93,7 +93,7 @@ class KeepAlivePlus(_PluginBase):
             "enabled": self._enabled,
             "onlyonce": self._onlyonce,
             "cron": self._cron,
-            "donor_sites": self._donor_sites,
+            "donor_sites": ",".join(self._donor_sites) if isinstance(self._donor_sites, list) else str(self._donor_sites or ""),
         })
 
     def get_state(self) -> bool:
@@ -102,6 +102,91 @@ class KeepAlivePlus(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         """无额外 API 端点。"""
         return []
+
+    def get_form(self) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any]]:
+        """拼装插件配置页面（Vuetify 组件）。"""
+        return [
+            {
+                "component": "VForm",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "enabled",
+                                            "label": "启用插件",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "onlyonce",
+                                            "label": "立即运行一次",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "cron",
+                                            "label": "定时重算周期（cron 表达式）",
+                                            "placeholder": "0 7 * * *",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "donor_sites",
+                                            "label": "捐赠/黄星站点标识（逗号或换行分隔）",
+                                            "rows": 3,
+                                            "placeholder": "hdsky,pterclub",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            }
+        ], {
+            "enabled": False,
+            "onlyonce": False,
+            "cron": "0 7 * * *",
+            "donor_sites": "",
+        }
 
     def _setup_scheduler(self):
         self.stop_service()
