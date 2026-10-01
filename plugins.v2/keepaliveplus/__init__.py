@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.3"
+    plugin_version = "0.1.4"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -49,12 +49,15 @@ class KeepAlivePlus(_PluginBase):
 
     _enabled = False
     _onlyonce = False
+    _daily = True
+    _monthly = True
     _cron = ""
     _donor_sites: List[str] = []
     _scheduler: Optional[BackgroundScheduler] = None
 
-    # 规则库候选路径（软依赖：存在即用）
+    # 规则库候选路径（自有目录优先：站点实锤修正版防市场插件更新覆盖；ptdepilermp 目录兜底）
     RULES_DIRS = [
+        "/config/keepaliveplus_rules",
         "/app/app/plugins/ptdepilermp/site_rules",
     ]
     # 保号豁免关键词（简繁 + 措辞变体全收）
@@ -78,6 +81,8 @@ class KeepAlivePlus(_PluginBase):
         config = dict(config or {})
         self._enabled = bool(config.get("enabled", False))
         self._onlyonce = bool(config.get("onlyonce", False))
+        self._daily = bool(config.get("daily_refresh", True))
+        self._monthly = bool(config.get("monthly_refresh", True))
         self._cron = str(config.get("cron") or "").strip()
         donor = config.get("donor_sites") or []
         self._donor_sites = [str(s).strip() for s in (donor if isinstance(donor, list) else str(donor).split(",")) if str(s).strip()]
@@ -92,6 +97,8 @@ class KeepAlivePlus(_PluginBase):
         self.update_config({
             "enabled": self._enabled,
             "onlyonce": self._onlyonce,
+            "daily_refresh": self._daily,
+            "monthly_refresh": self._monthly,
             "cron": self._cron,
             "donor_sites": ",".join(self._donor_sites) if isinstance(self._donor_sites, list) else str(self._donor_sites or ""),
         })
@@ -148,10 +155,41 @@ class KeepAlivePlus(_PluginBase):
                                 "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "daily_refresh",
+                                            "label": "每日刷新2次（07:30/19:30，异常推送提醒）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "monthly_refresh",
+                                            "label": "每月1日存档站点规则页并提醒核对",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
                                         "component": "VTextField",
                                         "props": {
                                             "model": "cron",
-                                            "label": "定时重算周期（cron 表达式）",
+                                            "label": "额外重算周期（cron 表达式，可空）",
                                             "placeholder": "0 7 * * *",
                                         },
                                     }
@@ -184,39 +222,70 @@ class KeepAlivePlus(_PluginBase):
         ], {
             "enabled": False,
             "onlyonce": False,
-            "cron": "0 7 * * *",
+            "daily_refresh": True,
+            "monthly_refresh": True,
+            "cron": "",
             "donor_sites": "",
         }
 
     def _setup_scheduler(self):
         self.stop_service()
-        if self._cron and self._enabled:
+        if not (self._enabled and (self._cron or self._daily or self._monthly)):
+            return
+        try:
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+        except Exception as err:
+            logger.error("%s 调度器创建失败：%s", self.plugin_name, err)
+            self._scheduler = None
+            return
+        if self._cron:
             try:
-                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
                 self._scheduler.add_job(
                     func=self._recalculate, trigger=CronTrigger.from_crontab(self._cron),
                     name="保号状态增强重算", id="keepaliveplus_recalc",
                 )
-                self._scheduler.start()
                 logger.info("%s 定时重算任务已注册：cron=%s", self.plugin_name, self._cron)
             except Exception as err:
                 logger.error("%s cron 无效：%s", self.plugin_name, err)
+        if self._daily:
+            try:
+                self._scheduler.add_job(
+                    func=self._recalculate, trigger=CronTrigger.from_crontab("30 7,19 * * *"),
+                    args=["每日定时刷新"], name="每日数据刷新(2次/天)", id="keepaliveplus_daily",
+                )
+                logger.info("%s 每日数据刷新任务已注册：每天 07:30 / 19:30", self.plugin_name)
+            except Exception as err:
+                logger.error("%s 每日任务注册失败：%s", self.plugin_name, err)
+        if self._monthly:
+            try:
+                self._scheduler.add_job(
+                    func=self._monthly_rules_snapshot, trigger=CronTrigger.from_crontab("0 6 1 * *"),
+                    name="月度站点规则存档", id="keepaliveplus_monthly",
+                )
+                logger.info("%s 月度站点规则存档任务已注册：每月1日 06:00", self.plugin_name)
+            except Exception as err:
+                logger.error("%s 月度任务注册失败：%s", self.plugin_name, err)
+        try:
+            self._scheduler.start()
+        except Exception as err:
+            logger.error("%s 调度器启动失败：%s", self.plugin_name, err)
 
     def stop_service(self):
         try:
             if self._scheduler:
                 self._scheduler.remove_job("keepaliveplus_recalc")
+                self._scheduler.remove_job("keepaliveplus_daily")
+                self._scheduler.remove_job("keepaliveplus_monthly")
         except Exception:
             pass
 
     # ---------------- 数据与判定 ----------------
 
     @property
-    def rules_dir(self) -> Optional[Path]:
-        for d in self.RULES_DIRS:
-            if os.path.isdir(d):
-                return Path(d)
-        return None
+    @property
+    def rule_dirs(self) -> List[Path]:
+        """所有存在的规则目录（自有目录优先）。"""
+        return [Path(d) for d in self.RULES_DIRS if os.path.isdir(d)]
 
     @staticmethod
     def _video_duration(video: str) -> Optional[float]:
@@ -232,29 +301,41 @@ class KeepAlivePlus(_PluginBase):
                 where id in (select max(id) from siteuserdata group by domain)
                 order by updated_time desc
             """).fetchall()
+            # 仅保留当前站点表里存在的域名（过滤旧域名残留快照，如憨憨 hhanclub.top）
+            site_domains = set()
+            for s in con.execute("select url from site"):
+                u = (s["url"] or "").lower().strip()
+                if "//" in u:
+                    u = u.split("//", 1)[1]
+                u = u.split("/", 1)[0].strip()
+                if u:
+                    site_domains.add(u)
             con.close()
-            return [dict(r) for r in rows]
+            return [dict(r) for r in rows if (r.get("domain") or "").lower() in site_domains]
         except Exception as err:
             logger.error("%s 读取站点快照失败：%s", self.plugin_name, err)
             return []
 
     def _load_rule(self, site_name: str) -> Optional[Dict[str, Any]]:
-        rd = self.rules_dir
-        if not rd:
+        dirs = self.rule_dirs
+        if not dirs:
             return None
-        exact = rd / ("%s.json" % site_name)
-        if exact.exists():
-            try:
-                return json.loads(exact.read_text(encoding="utf-8"))
-            except Exception:
-                return None
         low = site_name.lower()
-        for fn in os.listdir(rd):
-            if fn.lower().startswith(low[:4]) and fn.endswith(".json"):
+        # 先全目录精确匹配（自有目录优先），再退回前缀匹配
+        for rd in dirs:
+            exact = rd / ("%s.json" % site_name)
+            if exact.exists():
                 try:
-                    return json.loads((rd / fn).read_text(encoding="utf-8"))
+                    return json.loads(exact.read_text(encoding="utf-8"))
                 except Exception:
-                    return None
+                    continue
+        for rd in dirs:
+            for fn in os.listdir(rd):
+                if fn.lower().startswith(low[:4]) and fn.endswith(".json"):
+                    try:
+                        return json.loads((rd / fn).read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
         return None
 
     @staticmethod
@@ -298,8 +379,49 @@ class KeepAlivePlus(_PluginBase):
         low = site_name.lower()
         return any(d.lower() in low or low in d.lower() for d in self._donor_sites if d)
 
+    @staticmethod
+    def _cond_text(lv: Dict[str, Any]) -> str:
+        """豁免等级达标条件清单（按规则文件字段拼接）。"""
+        parts = []
+        m = re.match(r"P(\d+)([WDMY])", str(lv.get("interval") or ""))
+        if m:
+            unit = {"W": "周", "D": "天", "M": "个月", "Y": "年"}.get(m.group(2), m.group(2))
+            parts.append("注册≥%s%s" % (m.group(1), unit))
+        if lv.get("downloaded"):
+            parts.append("下载≥%s" % lv["downloaded"])
+        if lv.get("uploaded"):
+            parts.append("上传≥%s" % lv["uploaded"])
+        if lv.get("ratio"):
+            parts.append("分享率≥%s" % lv["ratio"])
+        if lv.get("bonus"):
+            parts.append("魔力≥%s" % lv["bonus"])
+        m2 = re.match(r"P(\d+)D", str(lv.get("seedingTime") or ""))
+        if m2:
+            parts.append("做种≥%s天" % m2.group(1))
+        if lv.get("uploads"):
+            parts.append("发种≥%s个" % lv["uploads"])
+        if lv.get("snatches"):
+            parts.append("完成≥%s个" % lv["snatches"])
+        return "、".join(parts)
+
     def _recalculate(self, trigger: str = "内部调用"):
-        rows = self._snapshot_rows()
+        try:
+            rows = self._snapshot_rows()
+        except Exception as err:
+            logger.error("%s 读取站点快照异常：%s", self.plugin_name, err)
+            try:
+                self.post_message(title="%s 数据刷新异常" % self.plugin_name,
+                                  text="读取站点快照失败：%s" % err)
+            except Exception:
+                pass
+            return
+        if not rows:
+            logger.warning("%s 站点快照为空，可能站点数据未刷新", self.plugin_name)
+            try:
+                self.post_message(title="%s 数据刷新异常" % self.plugin_name,
+                                  text="站点快照为空：请检查 PTDepilerMp 站点刷新是否正常运行。")
+            except Exception:
+                pass
         out = []
         for r in rows:
             domain = r.get("domain") or ""
@@ -307,30 +429,38 @@ class KeepAlivePlus(_PluginBase):
             user_level = r.get("user_level")
             rule = self._load_rule(site_name)
             levels = (rule or {}).get("levels", [])
+            risk = (rule or {}).get("risk_note") or ""
             ret_lv = self._retention_level(levels) if levels else None
             cur_lv = self._match_level(levels, user_level) if levels else None
             donor = self._is_donor(site_name)
             if donor:
                 status, note = "✅ 已保号", "捐赠/黄星站点（配置指定）"
+                if risk:
+                    note += "。⚠️ %s" % risk
             elif not rule:
                 status, note = "ℹ️ 登录保号中", "无站点规则（每日自动登录已覆盖）"
             elif ret_lv is None:
                 status, note = "ℹ️ 登录保号中", "规则未定义保号豁免等级（每日自动登录已覆盖）"
+                if risk:
+                    note += "。⚠️ %s" % risk
             else:
                 ret_id = int(ret_lv.get("id", 0) or 0)
                 cur_id = int(cur_lv.get("id", 0) or 0) if cur_lv else None
                 ret_name = ret_lv.get("name") or "未配置"
                 if cur_id is None:
                     status, note = "ℹ️ 登录保号中", "快照等级无法匹配规则等级表（每日自动登录已覆盖）"
+                    if risk:
+                        note += "。⚠️ %s" % risk
                 elif cur_id >= ret_id:
-                    status, note = "✅ 已保号", "当前等级已达豁免等级「%s」" % ret_name
+                    status, note = "✅ 已保号", "已达豁免等级「%s」" % ret_name
+                    if risk:
+                        note += "。⚠️ %s" % risk
                 else:
-                    req = " / ".join(filter(None, [
-                        "分享率 " + str(ret_lv.get("ratio")) if ret_lv.get("ratio") else "",
-                        "下载 " + str(ret_lv.get("downloaded")) if ret_lv.get("downloaded") else "",
-                    ]))
-                    status, note = "⚠️ 未保号（登录保号中）", "距豁免等级「%s」还差 %d 级%s" % (
-                        ret_name, ret_id - cur_id, ("（需 %s）" % req) if req else "")
+                    cond = self._cond_text(ret_lv)
+                    note = "距豁免「%s」还差 %d 级。需：%s" % (ret_name, ret_id - cur_id, cond or "见站点规则")
+                    if risk:
+                        note += "。⚠️ %s" % risk
+                    status = "⚠️ 未保号（登录保号中）"
             out.append({
                 "site": site_name, "domain": domain,
                 "user_level": user_level or "无快照",
@@ -342,6 +472,15 @@ class KeepAlivePlus(_PluginBase):
         self._cached_rows = out
         self._has_calculated = True
         logger.info("%s 保号状态重算完成（触发=%s，站点数=%d）", self.plugin_name, trigger, len(out))
+        # 刷新异常提示：等级缺失/无快照的站点
+        bad = ["%s(%s)" % (o["site"], o["user_level"]) for o in out
+               if not o.get("user_level") or o["user_level"] == "无快照"]
+        if bad:
+            try:
+                self.post_message(title="%s 数据刷新异常" % self.plugin_name,
+                                  text="以下站点快照等级缺失：%s。请检查对应站点 Cookie/登录状态。" % "、".join(bad))
+            except Exception:
+                pass
 
     def _rows(self) -> List[Dict[str, Any]]:
         if not self._has_calculated:
@@ -356,6 +495,57 @@ class KeepAlivePlus(_PluginBase):
             self._recalculate("站点全量刷新通知")
         except Exception as err:
             logger.error("%s 全站刷新后重算失败：%s", self.plugin_name, err)
+
+    def _monthly_rules_snapshot(self):
+        """月度站点规则存档：重抓各站 FAQ/规则页落盘，完成后推送提醒人工核对。"""
+        import time as _time
+        from datetime import datetime
+        try:
+            import requests
+        except Exception as err:
+            logger.error("%s 月度存档缺少 requests：%s", self.plugin_name, err)
+            return
+        ym = datetime.now().strftime("%Y%m")
+        outdir = Path("/config/_wb_keepalive_raw/monthly") / ym
+        try:
+            outdir.mkdir(parents=True, exist_ok=True)
+        except Exception as err:
+            logger.error("%s 月度存档目录创建失败：%s", self.plugin_name, err)
+            return
+        con = sqlite3.connect("file:/config/user.db?mode=ro", uri=True, timeout=10)
+        con.row_factory = sqlite3.Row
+        sites = con.execute("select id, name, url, cookie, ua from site order by id").fetchall()
+        con.close()
+        seen, ok, fail = set(), [], []
+        for s in sites:
+            base = (s["url"] or "").rstrip("/")
+            dom = base.split("//")[-1].split("/")[0]
+            if not base or dom in seen:
+                continue
+            seen.add(dom)
+            headers = {
+                "User-Agent": (s["ua"] or "").strip() or "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Cookie": s["cookie"] or "",
+                "Referer": base + "/index.php",
+            }
+            got = []
+            for page in ("rules.php", "faq.php", "wiki.php"):
+                try:
+                    resp = requests.get(base + "/" + page, headers=headers, timeout=25, allow_redirects=True)
+                    if resp.status_code == 200 and len(resp.content) > 3000:
+                        (outdir / ("%d_%s_%s.html" % (s["id"], dom.split(".")[0], page.replace(".php", "")))).write_bytes(resp.content)
+                        got.append(page)
+                except Exception:
+                    pass
+                _time.sleep(3)
+            (ok if got else fail).append(s["name"])
+        summary = "成功 %d 站：%s%s失败 %d 站：%s%s存档目录：%s%s请打开存档页面对照保号等级规则是否有变化，有变化请告知助手更新规则文件。" % (
+            len(ok), "、".join(ok), "\n", len(fail), "、".join(fail), "\n", outdir, "\n")
+        try:
+            self.post_message(title="%s 月度站点规则存档完成" % self.plugin_name, text=summary)
+        except Exception as err:
+            logger.error("%s 月度存档通知发送失败：%s", self.plugin_name, err)
+        logger.info("%s 月度站点规则存档完成：成功%d/失败%d", self.plugin_name, len(ok), len(fail))
 
     # ---------------- 页面 ----------------
 
