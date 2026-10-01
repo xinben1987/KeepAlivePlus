@@ -440,8 +440,10 @@ class KeepAlivePlus(_PluginBase):
                 need_gb = self._size_gb(need)
                 if need_gb is None:
                     return None
+                # 规则字段名 downloaded/uploaded 对应快照字段名 download/upload
+                rowkey = "download" if key == "downloaded" else "upload"
                 label = "下载" if key == "downloaded" else "上传"
-                diff = need_gb - (row.get(key) or 0) / (1 << 30)
+                diff = need_gb - (row.get(rowkey) or 0) / (1 << 30)
                 if diff <= 0.5:
                     return None
                 if diff >= 1024:
