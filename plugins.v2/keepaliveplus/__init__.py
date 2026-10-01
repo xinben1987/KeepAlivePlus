@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -101,8 +101,10 @@ class KeepAlivePlus(_PluginBase):
         # 搜索优选:开启时按下载缺口重排站点优先级,关闭时还原原优先级
         if self._search_boost:
             self._apply_search_priority()
+            self._install_seeders_order_patch()
         else:
             self._restore_search_priority()
+            self._uninstall_seeders_order_patch()
 
     def __save_config(self):
         self.update_config({
@@ -805,6 +807,50 @@ class KeepAlivePlus(_PluginBase):
             logger.info("%s 已还原原站点搜索优先级(%d 站)", self.plugin_name, len(backup))
         except Exception as err:
             logger.error("%s 还原站点优先级失败：%s", self.plugin_name, err)
+
+    _kap_orig_parse: Any = None
+
+    def _install_seeders_order_patch(self):
+        """安装站内做种数降序补丁：包装 IndexerModule.__parse_result，
+        使每个站的搜索结果按做种数降序返回——前端"站点"排序(稳定)即得到
+        「站点缺口优先 + 站内做种数降序」的组合排序。补丁随插件重载重打，升级免疫。"""
+        try:
+            from app.modules.indexer import IndexerModule
+            attr = "_IndexerModule__parse_result"
+            orig = getattr(IndexerModule, attr, None)
+            if orig is None:
+                logger.warning("%s 未找到搜索解析函数，做种数排序补丁跳过", self.plugin_name)
+                return
+            if getattr(orig, "_kap_seeded", False):
+                return
+            KeepAlivePlus._kap_orig_parse = orig
+
+            def patched(site, result_array, seconds, _orig=orig):
+                torrents = _orig(site, result_array, seconds)
+                try:
+                    torrents.sort(key=lambda t: -(getattr(t, "seeders", 0) or 0))
+                except Exception:
+                    pass
+                return torrents
+
+            patched._kap_seeded = True
+            setattr(IndexerModule, attr, staticmethod(patched))
+            logger.info("%s 站内做种数降序补丁已安装", self.plugin_name)
+        except Exception as err:
+            logger.error("%s 做种数排序补丁安装失败：%s", self.plugin_name, err)
+
+    def _uninstall_seeders_order_patch(self):
+        """卸载补丁，还原原解析函数。"""
+        orig = KeepAlivePlus._kap_orig_parse
+        if orig is None:
+            return
+        try:
+            from app.modules.indexer import IndexerModule
+            setattr(IndexerModule, "_IndexerModule__parse_result", staticmethod(orig))
+            KeepAlivePlus._kap_orig_parse = None
+            logger.info("%s 站内做种数降序补丁已卸载", self.plugin_name)
+        except Exception as err:
+            logger.error("%s 补丁卸载失败：%s", self.plugin_name, err)
 
     def _rows(self) -> List[Dict[str, Any]]:
         if not self._has_calculated:
