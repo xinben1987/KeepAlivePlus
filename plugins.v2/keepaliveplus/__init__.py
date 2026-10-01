@@ -101,12 +101,6 @@ class KeepAlivePlus(_PluginBase):
         # 搜索优选:开启时按下载缺口重排站点优先级,关闭时还原原优先级
         if self._search_boost:
             self._apply_search_priority()
-            self._install_seeders_order_patch()
-            self._install_stream_sort_patch()
-        else:
-            self._restore_search_priority()
-            self._uninstall_seeders_order_patch()
-            self._uninstall_stream_sort_patch()
 
     def __save_config(self):
         self.update_config({
