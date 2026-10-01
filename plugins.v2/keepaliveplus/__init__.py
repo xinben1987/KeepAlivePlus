@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.11"
+    plugin_version = "0.1.12"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -429,24 +429,21 @@ class KeepAlivePlus(_PluginBase):
         return v * factor if factor else None
 
     def _ratio_text(self, lv: Optional[Dict[str, Any]], row: Dict[str, Any]) -> str:
-        """分享率表述：每站必显示（达标/差额/无要求）。"""
-        cur = row.get("ratio")
+        """分享率表述（列内精简版）：达标✓/未达标✗/无要求。"""
         try:
-            cur_v = float(cur)
+            cur_v = float(row.get("ratio"))
         except (TypeError, ValueError):
-            cur_v = None
+            return "无数据"
         need = lv.get("ratio") if lv else None
         try:
             need_v = float(need) if need is not None else None
         except (TypeError, ValueError):
             need_v = None
-        if cur_v is None:
-            return "分享率:快照无数据"
         if need_v is None:
-            return "当前分享率%.2f(该档无分享率要求)" % cur_v
+            return "%.2f(无要求)" % cur_v
         if cur_v >= need_v:
-            return "分享率%.2f已达标(需≥%.2f)" % (cur_v, need_v)
-        return "分享率还差%.2f(现%.2f/需≥%.2f)" % (need_v - cur_v, cur_v, need_v)
+            return "%.2f✓(需%.2f)" % (cur_v, need_v)
+        return "%.2f✗(需%.2f,差%.2f)" % (cur_v, need_v, need_v - cur_v)
 
     def _field_gap(self, key: str, need, row: Dict[str, Any]) -> Optional[str]:
         """单个条件字段的差距描述；已达标或无法比较返回 None。"""
@@ -512,9 +509,9 @@ class KeepAlivePlus(_PluginBase):
         return "、".join(gaps)
 
     def _risk_text(self, rule: Optional[Dict[str, Any]], row: Dict[str, Any]) -> str:
-        """按当前状态生成红线提示：直说距禁用/删除红线还剩多少天。"""
+        """红线简报（列内精简版）：动作+两档天数+登录链路状态。"""
         if not rule:
-            return ""
+            return "—"
         lag = 0
         upd_day = str(row.get("updated_day") or "")
         if upd_day:
@@ -526,23 +523,27 @@ class KeepAlivePlus(_PluginBase):
         days1 = rule.get("risk_days")
         days2 = rule.get("risk2_days")
 
-        def _remain(days):
+        def _r(days):
             if not isinstance(days, (int, float)) or days <= 0:
                 return None
             return int(days) - max(lag, 0)
 
-        r1, r2 = _remain(days1), _remain(days2)
-        if r1 is not None and action:
-            txt = "距%s红线约%d天(未封存)" % (action, r1)
+        r1, r2 = _r(days1), _r(days2)
+        if r1 is None or not action:
+            extra = rule.get("risk_extra") or rule.get("risk_note") or ""
+            return extra[:70] if extra else "—"
+        sep = "、"
+        if lag > 0:
+            head = "‼️停更%d天" % lag
+            seg = "剩约%d天(未封)" % r1 if r1 > 0 else "已到线"
             if r2 is not None:
-                txt += "/约%d天(封存)" % r2
-            if lag > 0:
-                txt += ";‼️快照已停更%d天,按最后活跃倒数" % lag
-            else:
-                txt += ";当前每日登录覆盖中"
-            return txt
-        extra = rule.get("risk_extra") or rule.get("risk_note") or ""
-        return ("预计:%s" % extra) if extra else ""
+                seg += "、剩约%d天(封)" % r2 if r2 > 0 else "、封存档也到线"
+        else:
+            head = "✓登录覆盖中"
+            seg = "约%d天(未封)" % r1
+            if r2 is not None:
+                seg += "、约%d天(封)" % r2
+        return "%s红线%s:%s" % (action, head, sep.join([seg]))
 
     @staticmethod
     def _cond_text(lv: Dict[str, Any]) -> str:
@@ -616,63 +617,52 @@ class KeepAlivePlus(_PluginBase):
             user_level = r.get("user_level")
             rule = self._load_rule(site_name)
             levels = (rule or {}).get("levels", [])
-            risk_txt = self._risk_text(rule, r)
             perm_lv = self._permanent_level(levels) if levels else None
             seal_lv = self._seal_level(levels) if levels else None
             cur_lv = self._match_level(levels, user_level) if levels else None
             donor = self._is_donor(site_name)
+            tgt_lv = perm_lv if perm_lv is not None else seal_lv
+            ratio_txt = self._ratio_text(tgt_lv, r)
+            risk_txt = self._risk_text(rule, r)
+            gap_txt = "—"
             if donor:
-                status, note = "✅ 已保号", "捐赠/黄星站点（配置指定）"
-                if risk_txt:
-                    note += "。⚠️ " + risk_txt
+                status = "✅ 已保号"
+                gap_txt = "捐赠/黄星站点"
             elif not rule:
-                status, note = "ℹ️ 登录保号中", "无站点规则（每日自动登录已覆盖）"
+                status = "ℹ️ 登录保号中"
+                gap_txt = "无站点规则"
+                risk_txt = "—"
             elif perm_lv is None and seal_lv is None:
-                status, note = "ℹ️ 登录保号中", "规则未定义保号豁免等级（每日自动登录已覆盖）"
-                if risk_txt:
-                    note += "。⚠️ " + risk_txt
+                status = "ℹ️ 登录保号中"
+                gap_txt = "规则无豁免档"
+                risk_txt = "—"
             else:
                 # 判定基准=无条件永久保留档（封存型豁免不算已保号）
-                tgt_lv = perm_lv if perm_lv is not None else seal_lv
                 tgt_id = int(tgt_lv.get("id", 0) or 0)
                 tgt_name = tgt_lv.get("name") or "未配置"
                 cur_id = int(cur_lv.get("id", 0) or 0) if cur_lv else None
-                ratio_txt = self._ratio_text(tgt_lv, r)
                 if cur_id is None:
-                    status, note = "ℹ️ 登录保号中", "快照等级无法匹配规则等级表（每日自动登录已覆盖）"
-                    if risk_txt:
-                        note += "。⚠️ " + risk_txt
+                    status = "ℹ️ 登录保号中"
+                    gap_txt = "等级未匹配"
                 elif perm_lv is not None and cur_id >= tgt_id:
-                    status, note = "✅ 已保号", "已达永久保留档「%s」:账号永不删号" % tgt_name
-                    if ratio_txt:
-                        note += "。" + ratio_txt
-                    # 全员冻结/禁用型(春天/北洋园):不删号但会被冻结/禁用,该红线仍适用
-                    if rule.get("risk_applies_to_permanent") and risk_txt:
-                        note += ";但不活跃仍会被" + (rule.get("risk_action") or "处置")
-                        note += "。⚠️ " + risk_txt
+                    status = "✅ 已保号"
+                    gap_txt = "已达「%s」永久保留" % tgt_name
+                    # 无条件永久保留 = 不活跃红线不适用；仅全员冻结/禁用型(春天/北洋园)例外
+                    if not rule.get("risk_applies_to_permanent"):
+                        risk_txt = "—"
                 elif perm_lv is None and cur_id >= tgt_id:
-                    status = "✅ 已达标（封存型）"
-                    note = "已达封存保号档「%s」：封存账号后豁免" % tgt_name
-                    if ratio_txt:
-                        note += "。" + ratio_txt
-                    if risk_txt:
-                        note += "。⚠️ " + risk_txt
+                    status = "✅ 已达标(封存型)"
+                    gap_txt = "已达「%s」,封存后豁免" % tgt_name
                 else:
+                    status = "⚠️ 未保号"
                     gaps = self._gap_text(tgt_lv, r)
                     cond = self._cond_text(tgt_lv)
-                    tgt_label = "永久保留档" if perm_lv is not None else "封存可保档"
-                    if gaps:
-                        note = "距%s「%s」差 %d 级 | %s | 实际差距：%s" % (tgt_label, tgt_name, tgt_id - cur_id, ratio_txt, gaps)
-                    else:
-                        note = "距%s「%s」差 %d 级 | %s | 需满足：%s" % (tgt_label, tgt_name, tgt_id - cur_id, ratio_txt, cond or "见站点规则")
-                    if risk_txt:
-                        note += "。⚠️ " + risk_txt
-                    status = "⚠️ 未保号（登录保号中）"
+                    detail = gaps or cond or "见站点规则"
+                    gap_txt = "距「%s」差%d级\n%s" % (tgt_name, tgt_id - cur_id, detail)
             out.append({
                 "site": site_name, "domain": domain,
                 "user_level": user_level or "无快照",
-                "retention_level": ((perm_lv or seal_lv) or {}).get("name") or "未配置",
-                "status": status, "note": note,
+                "status": status, "ratio": ratio_txt, "gap": gap_txt, "risk": risk_txt,
                 "updated": r.get("updated_time"),
                 "err_msg": r.get("err_msg"),
                 "donor": donor,
@@ -762,13 +752,15 @@ class KeepAlivePlus(_PluginBase):
     # ---------------- 页面 ----------------
 
     def get_page(self) -> List[dict]:
-        """返回保号状态详情页（全站表格）。"""
+        """返回保号状态详情页（分列排版：状态着色，红线/差距/分享率独立列）。"""
         rows = sorted(self._rows(), key=lambda r: r.get("site") or "")
-        headers = ["站点", "当前等级", "保号状态", "保号豁免等级", "说明", "数据时间"]
+        headers = ["站点", "当前等级", "保号状态", "分享率", "距永久档差距", "不活跃红线", "数据时间"]
         total = len(rows)
         ok_cnt = sum(1 for r in rows if "已保号" in (r.get("status") or ""))
-        login_cnt = total - ok_cnt
-        summary_text = f"共 {total} 站：\u2705 已保号 {ok_cnt} 站 | \u2139 登录保号 {login_cnt} 站"
+        seal_cnt = sum(1 for r in rows if "封存型" in (r.get("status") or ""))
+        warn_cnt = sum(1 for r in rows if "未保号" in (r.get("status") or ""))
+        login_cnt = total - ok_cnt - seal_cnt - warn_cnt
+        summary_text = f"共 {total} 站：✅ 已保号 {ok_cnt} 站 | ✅ 已达标(封存型) {seal_cnt} 站 | ⚠️ 未保号 {warn_cnt} 站 | ℹ️ 登录保号中 {login_cnt} 站"
         thead = {
             "component": "thead",
             "content": [{
@@ -776,13 +768,47 @@ class KeepAlivePlus(_PluginBase):
                 "content": [{"component": "th", "props": {"class": "text-start"}, "text": h} for h in headers],
             }],
         }
+
+        def _status_cls(st):
+            if "✅" in st:
+                return "text-success"
+            if "⚠️" in st:
+                return "text-warning"
+            return "text-info"
+
+        def _ratio_cls(rt):
+            if "✓" in rt:
+                return "text-success"
+            if "✗" in rt:
+                return "text-error"
+            return "text-start"
+
+        def _risk_cls(rk):
+            if "‼️" in rk:
+                return "text-error"
+            if rk in ("—", ""):
+                return "text-start"
+            return "text-warning"
+
         trs = []
         for r in rows:
+            st = str(r.get("status") or "")
+            rt = str(r.get("ratio") or "")
+            rk = str(r.get("risk") or "")
+            cells = [
+                ("site", "text-start font-weight-medium"),
+                ("user_level", "text-start"),
+                ("status", "text-start " + _status_cls(st)),
+                ("ratio", "text-start " + _ratio_cls(rt)),
+                ("gap", "text-start"),
+                ("risk", "text-start " + _risk_cls(rk)),
+                ("updated", "text-start"),
+            ]
             trs.append({
                 "component": "tr",
                 "content": [
-                    {"component": "td", "props": {"class": "text-sm"}, "text": str(r.get(k) or "")}
-                    for k in ("site", "user_level", "status", "retention_level", "note", "updated")
+                    {"component": "td", "props": {"class": cls}, "text": str(r.get(k) or "")}
+                    for k, cls in cells
                 ],
             })
         vtable = {
