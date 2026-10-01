@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.8"
+    plugin_version = "0.1.9"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -578,7 +578,8 @@ class KeepAlivePlus(_PluginBase):
                         note += "。⚠️ " + risk_txt
                 elif perm_lv is not None and cur_id >= tgt_id:
                     status, note = "✅ 已保号", "已达无条件永久保留档「%s」" % tgt_name
-                    if risk_txt:
+                    # 无条件永久保留 = 不活跃删除/禁用红线不适用；仅"全员冻结/禁用型"(春天/北洋园)例外
+                    if rule.get("risk_applies_to_permanent") and risk_txt:
                         note += "。⚠️ " + risk_txt
                 elif perm_lv is None and cur_id >= tgt_id:
                     status = "✅ 已达标（封存型）"
