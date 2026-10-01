@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.2.1"
+    plugin_version = "0.2.2"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -102,9 +102,11 @@ class KeepAlivePlus(_PluginBase):
         if self._search_boost:
             self._apply_search_priority()
             self._install_seeders_order_patch()
+            self._install_combined_sort_patch()
         else:
             self._restore_search_priority()
             self._uninstall_seeders_order_patch()
+            self._uninstall_combined_sort_patch()
 
     def __save_config(self):
         self.update_config({
@@ -809,6 +811,47 @@ class KeepAlivePlus(_PluginBase):
             logger.error("%s 还原站点优先级失败：%s", self.plugin_name, err)
 
     _kap_orig_parse: Any = None
+    _kap_orig_search: Any = None
+
+    def _install_combined_sort_patch(self):
+        """组合排序补丁：包装 SearchChain.async_search_by_id，返回前按
+        「站点优先级(pri=下载缺口)升序 + 站内做种数降序」排序——
+        前端"默认"排序(保持后端顺序)即为保号优选组合排序。升级后插件重载自动重打。"""
+        try:
+            from app.chain.search.facade import SearchChain
+            orig = SearchChain.async_search_by_id
+            if getattr(orig, "_kap_sorted", False):
+                return
+            KeepAlivePlus._kap_orig_search = orig
+
+            async def patched(*args, **kwargs):
+                torrents = await orig(*args, **kwargs)
+                try:
+                    torrents.sort(key=lambda t: (
+                        (t.site_order if t.site_order is not None else 9999),
+                        -(getattr(t, "seeders", 0) or 0),
+                    ))
+                except Exception:
+                    pass
+                return torrents
+
+            patched._kap_sorted = True
+            SearchChain.async_search_by_id = patched
+            logger.info("%s 组合排序补丁已安装(站点优先级+站内做种数)", self.plugin_name)
+        except Exception as err:
+            logger.error("%s 组合排序补丁安装失败：%s", self.plugin_name, err)
+
+    def _uninstall_combined_sort_patch(self):
+        orig = KeepAlivePlus._kap_orig_search
+        if orig is None:
+            return
+        try:
+            from app.chain.search.facade import SearchChain
+            SearchChain.async_search_by_id = orig
+            KeepAlivePlus._kap_orig_search = None
+            logger.info("%s 组合排序补丁已卸载", self.plugin_name)
+        except Exception as err:
+            logger.error("%s 组合排序补丁卸载失败：%s", self.plugin_name, err)
 
     def _install_seeders_order_patch(self):
         """安装站内做种数降序补丁：包装 IndexerModule.__parse_result，
