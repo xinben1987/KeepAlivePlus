@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.6"
+    plugin_version = "0.1.7"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -452,7 +452,7 @@ class KeepAlivePlus(_PluginBase):
         return "、".join(gaps)
 
     def _risk_text(self, rule: Optional[Dict[str, Any]], row: Dict[str, Any]) -> str:
-        """按当前状态生成红线提示：两档（未封存/封存）距离禁用/删除红线还剩多少。"""
+        """按当前状态生成红线提示：直说距禁用/删除红线还剩多少天。"""
         if not rule:
             return ""
         lag = 0
@@ -462,28 +462,22 @@ class KeepAlivePlus(_PluginBase):
                 lag = (datetime.now() - datetime.strptime(upd_day, "%Y-%m-%d")).days
             except ValueError:
                 lag = 0
+        action = rule.get("risk_action") or ""
+        days1 = rule.get("risk_days")
+        days2 = rule.get("risk2_days")
 
-        def _seg(days, action, label) -> str:
-            if not isinstance(days, (int, float)) or days <= 0 or not action:
-                return ""
-            days = int(days)
-            dstr = "%d周(%d天)" % (days // 7, days) if days % 7 == 0 else "%d天" % days
-            remain = days - max(lag, 0)
-            if remain <= 0:
-                return "%s连续%s不登录→%s(‼️已到红线)" % (label, dstr, action)
-            return "%s连续%s不登录→%s(剩约%d天)" % (label, dstr, action, remain)
+        def _remain(days):
+            if not isinstance(days, (int, float)) or days <= 0:
+                return None
+            return int(days) - max(lag, 0)
 
-        parts = []
-        seg1 = _seg(rule.get("risk_days"), rule.get("risk_action"), "未封存")
-        if seg1:
-            parts.append(seg1)
-        seg2 = _seg(rule.get("risk2_days"), rule.get("risk2_action"), "封存")
-        if seg2:
-            parts.append(seg2)
-        if parts:
-            txt = "、".join(parts)
+        r1, r2 = _remain(days1), _remain(days2)
+        if r1 is not None and action:
+            txt = "⚠️ 距%s红线约%d天(未封存)" % (action, r1)
+            if r2 is not None:
+                txt += "/约%d天(封存)" % r2
             if lag > 0:
-                txt += ";‼️快照已停更%d天" % lag
+                txt += ";‼️快照已停更%d天,按最后活跃倒数" % lag
             else:
                 txt += ";当前每日登录覆盖中"
             return txt
@@ -564,6 +558,8 @@ class KeepAlivePlus(_PluginBase):
                         note += "。⚠️ " + risk_txt
                 elif cur_id >= ret_id:
                     status, note = "✅ 已保号", "已达豁免等级「%s」" % ret_name
+                    if (rule or {}).get("risk_exempt_mode") == "seal":
+                        note += "(豁免需封存账号后生效)"
                     if risk_txt:
                         note += "。⚠️ " + risk_txt
                 else:
