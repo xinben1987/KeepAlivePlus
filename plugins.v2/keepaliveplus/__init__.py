@@ -674,9 +674,6 @@ class KeepAlivePlus(_PluginBase):
         self._cached_rows = out
         self._has_calculated = True
         logger.info("%s 保号状态重算完成（触发=%s，站点数=%d）", self.plugin_name, trigger, len(out))
-        # 搜索优选：按最新缺口重排站点搜索优先级
-        if self._search_boost:
-            self._apply_search_priority()
         # 刷新异常提示：等级缺失 / 快照报错（err_msg）的站点
         bad = []
         for o in out:
