@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.5"
+    plugin_version = "0.1.6"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -451,6 +451,45 @@ class KeepAlivePlus(_PluginBase):
                 pass
         return "、".join(gaps)
 
+    def _risk_text(self, rule: Optional[Dict[str, Any]], row: Dict[str, Any]) -> str:
+        """按当前状态生成红线提示：两档（未封存/封存）距离禁用/删除红线还剩多少。"""
+        if not rule:
+            return ""
+        lag = 0
+        upd_day = str(row.get("updated_day") or "")
+        if upd_day:
+            try:
+                lag = (datetime.now() - datetime.strptime(upd_day, "%Y-%m-%d")).days
+            except ValueError:
+                lag = 0
+
+        def _seg(days, action, label) -> str:
+            if not isinstance(days, (int, float)) or days <= 0 or not action:
+                return ""
+            days = int(days)
+            dstr = "%d周(%d天)" % (days // 7, days) if days % 7 == 0 else "%d天" % days
+            remain = days - max(lag, 0)
+            if remain <= 0:
+                return "%s连续%s不登录→%s(‼️已到红线)" % (label, dstr, action)
+            return "%s连续%s不登录→%s(剩约%d天)" % (label, dstr, action, remain)
+
+        parts = []
+        seg1 = _seg(rule.get("risk_days"), rule.get("risk_action"), "未封存")
+        if seg1:
+            parts.append(seg1)
+        seg2 = _seg(rule.get("risk2_days"), rule.get("risk2_action"), "封存")
+        if seg2:
+            parts.append(seg2)
+        if parts:
+            txt = "、".join(parts)
+            if lag > 0:
+                txt += ";‼️快照已停更%d天" % lag
+            else:
+                txt += ";当前每日登录覆盖中"
+            return txt
+        extra = rule.get("risk_extra") or rule.get("risk_note") or ""
+        return ("预计:%s" % extra) if extra else ""
+
     @staticmethod
     def _cond_text(lv: Dict[str, Any]) -> str:
         """豁免等级达标条件清单（按规则文件字段拼接）。"""
@@ -501,54 +540,24 @@ class KeepAlivePlus(_PluginBase):
             user_level = r.get("user_level")
             rule = self._load_rule(site_name)
             levels = (rule or {}).get("levels", [])
-            risk = (rule or {}).get("risk_note") or ""
+            risk_txt = self._risk_text(rule, r)
             ret_lv = self._retention_level(levels) if levels else None
             cur_lv = self._match_level(levels, user_level) if levels else None
             donor = self._is_donor(site_name)
             if donor:
                 status, note = "✅ 已保号", "捐赠/黄星站点（配置指定）"
-                if risk:
-                    note += "。⚠️ %s" % risk
+                if risk_txt:
+                    note += "。⚠️ " + risk_txt
             elif not rule:
                 status, note = "ℹ️ 登录保号中", "无站点规则（每日自动登录已覆盖）"
             elif ret_lv is None:
                 status, note = "ℹ️ 登录保号中", "规则未定义保号豁免等级（每日自动登录已覆盖）"
-                if risk:
-                    note += "。⚠️ %s" % risk
+                if risk_txt:
+                    note += "。⚠️ " + risk_txt
             else:
                 ret_id = int(ret_lv.get("id", 0) or 0)
                 cur_id = int(cur_lv.get("id", 0) or 0) if cur_lv else None
                 ret_name = ret_lv.get("name") or "未配置"
-                # 红线动态：快照日期落后今天 N 天 → 提示登录链路停更
-                stale = ""
-                upd_day = str(r.get("updated_day") or "")
-                if upd_day:
-                    try:
-                        lag = (datetime.now() - datetime.strptime(upd_day, "%Y-%m-%d")).days
-                        if lag > 0:
-                            stale = "‼️站点数据已%d天未更新" % lag
-                    except ValueError:
-                        pass
-                if cur_id is None:
-                    status, note = "ℹ️ 登录保号中", "快照等级无法匹配规则等级表（每日自动登录已覆盖）"
-                    if risk:
-                        note += "。⚠️ %s" % risk
-                elif cur_id >= ret_id:
-                    status, note = "✅ 已保号", "已达豁免等级「%s」" % ret_name
-                    if risk:
-                        note += "。⚠️ %s" % risk
-                else:
-                    gaps = self._gap_text(ret_lv, r)
-                    cond = self._cond_text(ret_lv)
-                    if gaps:
-                        note = "距豁免「%s」差 %d 级 | 实际差距：%s" % (ret_name, ret_id - cur_id, gaps)
-                    else:
-                        note = "距豁免「%s」差 %d 级 | 需满足：%s" % (ret_name, ret_id - cur_id, cond or "见站点规则")
-                    if risk:
-                        note += "。⚠️ %s" % risk
-                    status = "⚠️ 未保号（登录保号中）"
-                if stale:
-                    note += "。%s" % stale
             out.append({
                 "site": site_name, "domain": domain,
                 "user_level": user_level or "无快照",
