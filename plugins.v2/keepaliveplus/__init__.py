@@ -558,6 +558,24 @@ class KeepAlivePlus(_PluginBase):
                 ret_id = int(ret_lv.get("id", 0) or 0)
                 cur_id = int(cur_lv.get("id", 0) or 0) if cur_lv else None
                 ret_name = ret_lv.get("name") or "未配置"
+                if cur_id is None:
+                    status, note = "ℹ️ 登录保号中", "快照等级无法匹配规则等级表（每日自动登录已覆盖）"
+                    if risk_txt:
+                        note += "。⚠️ " + risk_txt
+                elif cur_id >= ret_id:
+                    status, note = "✅ 已保号", "已达豁免等级「%s」" % ret_name
+                    if risk_txt:
+                        note += "。⚠️ " + risk_txt
+                else:
+                    gaps = self._gap_text(ret_lv, r)
+                    cond = self._cond_text(ret_lv)
+                    if gaps:
+                        note = "距豁免「%s」差 %d 级 | 实际差距：%s" % (ret_name, ret_id - cur_id, gaps)
+                    else:
+                        note = "距豁免「%s」差 %d 级 | 需满足：%s" % (ret_name, ret_id - cur_id, cond or "见站点规则")
+                    if risk_txt:
+                        note += "。⚠️ " + risk_txt
+                    status = "⚠️ 未保号（登录保号中）"
             out.append({
                 "site": site_name, "domain": domain,
                 "user_level": user_level or "无快照",
