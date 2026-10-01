@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.10"
+    plugin_version = "0.1.11"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -428,6 +428,26 @@ class KeepAlivePlus(_PluginBase):
         factor = {"T": 1024.0, "G": 1.0, "M": 1 / 1024.0, "K": 1 / (1024 * 1024), "": 1.0}.get(m.group(2))
         return v * factor if factor else None
 
+    def _ratio_text(self, lv: Optional[Dict[str, Any]], row: Dict[str, Any]) -> str:
+        """分享率表述：每站必显示（达标/差额/无要求）。"""
+        cur = row.get("ratio")
+        try:
+            cur_v = float(cur)
+        except (TypeError, ValueError):
+            cur_v = None
+        need = lv.get("ratio") if lv else None
+        try:
+            need_v = float(need) if need is not None else None
+        except (TypeError, ValueError):
+            need_v = None
+        if cur_v is None:
+            return "分享率:快照无数据"
+        if need_v is None:
+            return "当前分享率%.2f(该档无分享率要求)" % cur_v
+        if cur_v >= need_v:
+            return "分享率%.2f已达标(需≥%.2f)" % (cur_v, need_v)
+        return "分享率还差%.2f(现%.2f/需≥%.2f)" % (need_v - cur_v, cur_v, need_v)
+
     def _field_gap(self, key: str, need, row: Dict[str, Any]) -> Optional[str]:
         """单个条件字段的差距描述；已达标或无法比较返回 None。"""
         if need is None:
@@ -476,7 +496,8 @@ class KeepAlivePlus(_PluginBase):
             if any(p == "已达标" for p in parts):
                 return ""  # 二选一里已有满足的路径
             return "满足其一:" + " 或 ".join(parts)
-        gaps = [g for g in (self._field_gap(k, lv.get(k), row) for k in ("ratio", "downloaded", "uploaded", "bonus")) if g]
+        # 分享率单独成段（_ratio_text 已含），这里不再重复
+        gaps = [g for g in (self._field_gap(k, lv.get(k), row) for k in ("downloaded", "uploaded", "bonus")) if g]
         m = re.match(r"P(\d+)([WDMY])", str(lv.get("interval") or ""))
         join_at = str(row.get("join_at") or "")
         if m and join_at:
@@ -616,12 +637,15 @@ class KeepAlivePlus(_PluginBase):
                 tgt_id = int(tgt_lv.get("id", 0) or 0)
                 tgt_name = tgt_lv.get("name") or "未配置"
                 cur_id = int(cur_lv.get("id", 0) or 0) if cur_lv else None
+                ratio_txt = self._ratio_text(tgt_lv, r)
                 if cur_id is None:
                     status, note = "ℹ️ 登录保号中", "快照等级无法匹配规则等级表（每日自动登录已覆盖）"
                     if risk_txt:
                         note += "。⚠️ " + risk_txt
                 elif perm_lv is not None and cur_id >= tgt_id:
                     status, note = "✅ 已保号", "已达永久保留档「%s」:账号永不删号" % tgt_name
+                    if ratio_txt:
+                        note += "。" + ratio_txt
                     # 全员冻结/禁用型(春天/北洋园):不删号但会被冻结/禁用,该红线仍适用
                     if rule.get("risk_applies_to_permanent") and risk_txt:
                         note += ";但不活跃仍会被" + (rule.get("risk_action") or "处置")
@@ -629,6 +653,8 @@ class KeepAlivePlus(_PluginBase):
                 elif perm_lv is None and cur_id >= tgt_id:
                     status = "✅ 已达标（封存型）"
                     note = "已达封存保号档「%s」：封存账号后豁免" % tgt_name
+                    if ratio_txt:
+                        note += "。" + ratio_txt
                     if risk_txt:
                         note += "。⚠️ " + risk_txt
                 else:
@@ -636,9 +662,9 @@ class KeepAlivePlus(_PluginBase):
                     cond = self._cond_text(tgt_lv)
                     tgt_label = "永久保留档" if perm_lv is not None else "封存可保档"
                     if gaps:
-                        note = "距%s「%s」差 %d 级 | 实际差距：%s" % (tgt_label, tgt_name, tgt_id - cur_id, gaps)
+                        note = "距%s「%s」差 %d 级 | %s | 实际差距：%s" % (tgt_label, tgt_name, tgt_id - cur_id, ratio_txt, gaps)
                     else:
-                        note = "距%s「%s」差 %d 级 | 需满足：%s" % (tgt_label, tgt_name, tgt_id - cur_id, cond or "见站点规则")
+                        note = "距%s「%s」差 %d 级 | %s | 需满足：%s" % (tgt_label, tgt_name, tgt_id - cur_id, ratio_txt, cond or "见站点规则")
                     if risk_txt:
                         note += "。⚠️ " + risk_txt
                     status = "⚠️ 未保号（登录保号中）"
