@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.4"
+    plugin_version = "0.1.5"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -295,7 +295,8 @@ class KeepAlivePlus(_PluginBase):
             con = sqlite3.connect("file:/config/user.db?mode=ro", uri=True, timeout=10)
             con.row_factory = sqlite3.Row
             rows = con.execute("""
-                select domain, name, user_level, ratio, bonus, upload, download, updated_time
+                select domain, name, user_level, ratio, bonus, upload, download,
+                       join_at, updated_day, err_msg, updated_time
                 from siteuserdata
                 where id in (select max(id) from siteuserdata group by domain)
                 order by updated_time desc
@@ -396,6 +397,61 @@ class KeepAlivePlus(_PluginBase):
         return any(d.lower() in low or low in d.lower() for d in self._donor_sites if d)
 
     @staticmethod
+    def _size_gb(s) -> Optional[float]:
+        """解析 '512G'/'120GB'/'1T'/'1.5TB'/'25000G' 为 GB 数。"""
+        if not s:
+            return None
+        m = re.match(r"([\d.]+)\s*([TGMK]?)(?:I?B)?$", str(s).strip().upper())
+        if not m:
+            return None
+        try:
+            v = float(m.group(1))
+        except ValueError:
+            return None
+        factor = {"T": 1024.0, "G": 1.0, "M": 1 / 1024.0, "K": 1 / (1024 * 1024), "": 1.0}.get(m.group(2))
+        return v * factor if factor else None
+
+    def _gap_text(self, lv: Dict[str, Any], row: Dict[str, Any]) -> str:
+        """按快照数据计算到豁免等级的“实际差距”，无法计算的项不列。"""
+        gaps = []
+        if lv.get("ratio") is not None:
+            try:
+                diff = float(lv["ratio"]) - float(row.get("ratio") or 0)
+                if diff > 0:
+                    gaps.append("分享率还差%.2f" % diff)
+            except (TypeError, ValueError):
+                pass
+        need_dl = self._size_gb(lv.get("downloaded"))
+        if need_dl is not None:
+            diff = need_dl - (row.get("download") or 0) / (1 << 30)
+            if diff > 0.5:
+                gaps.append(("下载还差%.1fTB" % (diff / 1024)) if diff >= 1024 else ("下载还差%.0fGB" % diff))
+        need_ul = self._size_gb(lv.get("uploaded"))
+        if need_ul is not None:
+            diff = need_ul - (row.get("upload") or 0) / (1 << 30)
+            if diff > 0.5:
+                gaps.append(("上传还差%.1fTB" % (diff / 1024)) if diff >= 1024 else ("上传还差%.0fGB" % diff))
+        if lv.get("bonus") is not None:
+            try:
+                diff = float(lv["bonus"]) - float(row.get("bonus") or 0)
+                if diff > 0:
+                    gaps.append(("魔力还差%.0f" % diff) if diff >= 1 else "魔力已达标")
+            except (TypeError, ValueError):
+                pass
+        m = re.match(r"P(\d+)([WDMY])", str(lv.get("interval") or ""))
+        join_at = str(row.get("join_at") or "")
+        if m and join_at:
+            try:
+                joined = datetime.strptime(join_at[:10], "%Y-%m-%d")
+                need_days = {"W": 7, "D": 1, "M": 30, "Y": 365}.get(m.group(2), 0) * int(m.group(1))
+                alive_days = (datetime.now() - joined).days
+                if alive_days < need_days:
+                    gaps.append("注册还差%d天" % (need_days - alive_days))
+            except ValueError:
+                pass
+        return "、".join(gaps)
+
+    @staticmethod
     def _cond_text(lv: Dict[str, Any]) -> str:
         """豁免等级达标条件清单（按规则文件字段拼接）。"""
         parts = []
@@ -463,6 +519,16 @@ class KeepAlivePlus(_PluginBase):
                 ret_id = int(ret_lv.get("id", 0) or 0)
                 cur_id = int(cur_lv.get("id", 0) or 0) if cur_lv else None
                 ret_name = ret_lv.get("name") or "未配置"
+                # 红线动态：快照日期落后今天 N 天 → 提示登录链路停更
+                stale = ""
+                upd_day = str(r.get("updated_day") or "")
+                if upd_day:
+                    try:
+                        lag = (datetime.now() - datetime.strptime(upd_day, "%Y-%m-%d")).days
+                        if lag > 0:
+                            stale = "‼️站点数据已%d天未更新" % lag
+                    except ValueError:
+                        pass
                 if cur_id is None:
                     status, note = "ℹ️ 登录保号中", "快照等级无法匹配规则等级表（每日自动登录已覆盖）"
                     if risk:
@@ -472,29 +538,40 @@ class KeepAlivePlus(_PluginBase):
                     if risk:
                         note += "。⚠️ %s" % risk
                 else:
+                    gaps = self._gap_text(ret_lv, r)
                     cond = self._cond_text(ret_lv)
-                    note = "距豁免「%s」还差 %d 级。需：%s" % (ret_name, ret_id - cur_id, cond or "见站点规则")
+                    if gaps:
+                        note = "距豁免「%s」差 %d 级 | 实际差距：%s" % (ret_name, ret_id - cur_id, gaps)
+                    else:
+                        note = "距豁免「%s」差 %d 级 | 需满足：%s" % (ret_name, ret_id - cur_id, cond or "见站点规则")
                     if risk:
                         note += "。⚠️ %s" % risk
                     status = "⚠️ 未保号（登录保号中）"
+                if stale:
+                    note += "。%s" % stale
             out.append({
                 "site": site_name, "domain": domain,
                 "user_level": user_level or "无快照",
                 "retention_level": (ret_lv or {}).get("name") or "未配置",
                 "status": status, "note": note,
                 "updated": r.get("updated_time"),
+                "err_msg": r.get("err_msg"),
                 "donor": donor,
             })
         self._cached_rows = out
         self._has_calculated = True
         logger.info("%s 保号状态重算完成（触发=%s，站点数=%d）", self.plugin_name, trigger, len(out))
-        # 刷新异常提示：等级缺失/无快照的站点
-        bad = ["%s(%s)" % (o["site"], o["user_level"]) for o in out
-               if not o.get("user_level") or o["user_level"] == "无快照"]
+        # 刷新异常提示：等级缺失 / 快照报错（err_msg）的站点
+        bad = []
+        for o in out:
+            if not o.get("user_level") or o["user_level"] == "无快照":
+                bad.append("%s(无等级)" % o["site"])
+            elif o.get("err_msg"):
+                bad.append("%s(%s)" % (o["site"], str(o["err_msg"])[:40]))
         if bad:
             try:
                 self.post_message(title="%s 数据刷新异常" % self.plugin_name,
-                                  text="以下站点快照等级缺失：%s。请检查对应站点 Cookie/登录状态。" % "、".join(bad))
+                                  text="以下站点快照异常：%s。请检查对应站点 Cookie/登录状态。" % "、".join(bad))
             except Exception:
                 pass
 
