@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.3.0"
+    plugin_version = "0.3.1"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -913,6 +913,21 @@ class KeepAlivePlus(_PluginBase):
         warn_cnt = sum(1 for r in rows if "未保号" in (r.get("status") or ""))
         login_cnt = total - ok_cnt - seal_cnt - warn_cnt
         summary_text = f"共 {total} 站：✅ 已保号 {ok_cnt} 站 | ✅ 已达标(封存型) {seal_cnt} 站 | ⚠️ 未保号 {warn_cnt} 站 | ℹ️ 登录保号中 {login_cnt} 站"
+        # 保号优选速查:缺口站清单(按缺口从小到大),供搜索时勾选站点筛选+做种数排序
+        gap_rows = sorted(
+            [r for r in rows if "未保号" in (r.get("status") or "")],
+            key=lambda r: (r.get("gap_gb") or 0),
+        )
+
+        def _fmt_gb(v):
+            v = v or 0
+            return ("%.1fTB" % (v / 1024)) if v >= 1024 else ("%.0fGB" % v)
+
+        if gap_rows:
+            pick = "、".join("%s(缺%s)" % (r["site"], _fmt_gb(r.get("gap_gb"))) for r in gap_rows[:10])
+            summary_text += f"\n保号优选:搜索时站点筛选勾选→ {pick} ;排序选「做种数」"
+        else:
+            summary_text += "\n保号优选:当前无缺下载量的站点"
         thead = {
             "component": "thead",
             "content": [{
