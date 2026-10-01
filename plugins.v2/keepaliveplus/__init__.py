@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.3.1"
+    plugin_version = "0.3.2"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -174,7 +174,7 @@ class KeepAlivePlus(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "search_boost",
-                                            "label": "搜索优选(按下载缺口重排站点优先级)",
+                                            "label": "下载选种缺口优先(订阅/自动下载优先缺下载站点)",
                                         },
                                     }
                                 ],
