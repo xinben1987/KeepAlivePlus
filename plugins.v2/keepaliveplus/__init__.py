@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -98,6 +98,10 @@ class KeepAlivePlus(_PluginBase):
 
     def get_state(self) -> bool:
         return self._enabled
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        """无额外 API 端点。"""
+        return []
 
     def _setup_scheduler(self):
         self.stop_service()
