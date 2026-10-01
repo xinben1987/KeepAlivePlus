@@ -301,17 +301,32 @@ class KeepAlivePlus(_PluginBase):
                 where id in (select max(id) from siteuserdata group by domain)
                 order by updated_time desc
             """).fetchall()
-            # 仅保留当前站点表里存在的域名（过滤旧域名残留快照，如憨憨 hhanclub.top）
+            # 仅保留当前站点表里存在的域名（过滤旧域名残留快照，如憨憨 hhanclub.top）。
+            # site.url 可能带 www/子域前缀而快照 domain 是规范域名，故按尾部匹配。
+            def _norm(d: str) -> str:
+                d = (d or "").lower().strip()
+                return d[4:] if d.startswith("www.") else d
+
             site_domains = set()
             for s in con.execute("select url from site"):
-                u = (s["url"] or "").lower().strip()
+                u = _norm(s["url"] or "")
                 if "//" in u:
                     u = u.split("//", 1)[1]
                 u = u.split("/", 1)[0].strip()
-                if u:
+                if u and "." in u:
                     site_domains.add(u)
             con.close()
-            return [dict(r) for r in rows if (r.get("domain") or "").lower() in site_domains]
+
+            def _matched(dom: str) -> bool:
+                d = _norm(dom)
+                if not d:
+                    return False
+                for sd in site_domains:
+                    if d == sd or d.endswith("." + sd) or sd.endswith("." + d):
+                        return True
+                return False
+
+            return [dict(r) for r in rows if _matched(r.get("domain") or "")]
         except Exception as err:
             logger.error("%s 读取站点快照失败：%s", self.plugin_name, err)
             return []
