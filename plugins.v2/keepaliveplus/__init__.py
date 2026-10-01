@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.3.2"
+    plugin_version = "0.3.3"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -51,7 +51,6 @@ class KeepAlivePlus(_PluginBase):
     _onlyonce = False
     _daily = True
     _monthly = True
-    _search_boost = False
     _cron = ""
     _donor_sites: List[str] = []
     _scheduler: Optional[BackgroundScheduler] = None
@@ -88,7 +87,6 @@ class KeepAlivePlus(_PluginBase):
         self._onlyonce = bool(config.get("onlyonce", False))
         self._daily = bool(config.get("daily_refresh", True))
         self._monthly = bool(config.get("monthly_refresh", True))
-        self._search_boost = bool(config.get("search_boost", False))
         self._cron = str(config.get("cron") or "").strip()
         donor = config.get("donor_sites") or []
         self._donor_sites = [str(s).strip() for s in (donor if isinstance(donor, list) else str(donor).split(",")) if str(s).strip()]
@@ -98,9 +96,8 @@ class KeepAlivePlus(_PluginBase):
             self._onlyonce = False
             self.__save_config()
         self._setup_scheduler()
-        # 搜索优选:开启时按下载缺口重排站点优先级,关闭时还原原优先级
-        if self._search_boost:
-            self._apply_search_priority()
+        # 排序实验回滚:还原站点优先级/排序规则,并清理残留的流式补丁
+        self._cleanup_sort_experiment()
 
     def __save_config(self):
         self.update_config({
@@ -108,7 +105,6 @@ class KeepAlivePlus(_PluginBase):
             "onlyonce": self._onlyonce,
             "daily_refresh": self._daily,
             "monthly_refresh": self._monthly,
-            "search_boost": self._search_boost,
             "cron": self._cron,
             "donor_sites": ",".join(self._donor_sites) if isinstance(self._donor_sites, list) else str(self._donor_sites or ""),
         })
@@ -160,19 +156,6 @@ class KeepAlivePlus(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "search_boost",
-                                            "label": "下载选种缺口优先(订阅/自动下载优先缺下载站点)",
-                                        },
-                                    }
-                                ],
-                            },
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
@@ -729,106 +712,44 @@ class KeepAlivePlus(_PluginBase):
         cur = (row.get("download") or 0) / (1 << 30)
         return max(0.0, need_gb - cur)
 
-    def _apply_search_priority(self):
-        """搜索优选:两件事。
-
-        1. 按下载缺口升序重排 site.pri(排序引擎里 999-pri 越大=越靠前);
-        2. 默认排序引擎(sort_torrents)的规则 TorrentsPriority 改为
-           ["site","seeder"]——站点优先级优先 + 做种数降序,
-           搜索结果链(result.py)默认即保号优选排序,前端无需任何操作。
-
-        首次启用时备份原 pri 与 TorrentsPriority 到 /config/keepaliveplus_pri_backup.json,
-        关闭功能时由 _restore_search_priority 还原。
-        """
-        if not self._has_calculated:
-            self._recalculate("搜索优选前置计算")
-        try:
-            import json as _json
-            backup_file = Path("/config/keepaliveplus_pri_backup.json")
-            con = sqlite3.connect("/config/user.db", timeout=15)
-            con.row_factory = sqlite3.Row
-            # 备份(兼容旧结构:纯 {id:pri})
-            backup = {"site_pri": {}, "torrents_priority": '["torrent", "upload", "seeder"]'}
-            if backup_file.exists():
-                try:
-                    old = _json.loads(backup_file.read_text(encoding="utf-8"))
-                    if "site_pri" in old:
-                        backup["site_pri"] = old.get("site_pri") or {}
-                        backup["torrents_priority"] = old.get("torrents_priority") or backup["torrents_priority"]
-                    else:
-                        backup["site_pri"] = old
-                except Exception:
-                    pass
-            if not backup["site_pri"]:
-                backup["site_pri"] = {str(r["id"]): (r["pri"] or 0) for r in con.execute("select id, pri from site")}
-            r = con.execute("select value from systemconfig where key='TorrentsPriority'").fetchone()
-            backup["torrents_priority"] = (r["value"] if r else None) or backup["torrents_priority"]
-            backup_file.write_text(_json.dumps(backup, ensure_ascii=False), encoding="utf-8")
-            logger.info("%s 已备份原站点优先级(%d 站)与排序规则", self.plugin_name, len(backup["site_pri"]))
-
-            def _norm(d):
-                d = (d or "").lower().strip()
-                return d[4:] if d.startswith("www.") else d
-
-            site_map = {}
-            for s in con.execute("select id, url from site"):
-                u = _norm(s["url"] or "")
-                if "//" in u:
-                    u = u.split("//", 1)[1]
-                u = u.split("/", 1)[0].strip()
-                if u:
-                    # 同一域名可能有多条站点记录(重复添加),全部收集
-                    site_map.setdefault(u, []).append(s["id"])
-
-            def _match_ids(dom):
-                d = _norm(dom)
-                ids = []
-                for u, sids in site_map.items():
-                    if d == u or d.endswith("." + u) or u.endswith("." + d):
-                        ids.extend(sids)
-                return ids
-
-            # 排序:有缺口的站在前(缺口升序,缺得少的最优先);缺口0(已保号)排后
-            items = []
-            for o in self._cached_rows:
-                ids = _match_ids(o.get("domain") or "")
-                for sid in ids:
-                    items.append((sid, float(o.get("gap_gb") or 0)))
-            items.sort(key=lambda x: (x[1] <= 0, x[1], x[0]))
-            pri = 0
-            for sid, _ in items:
-                pri += 1
-                con.execute("update site set pri=? where id=?", (pri, sid))
-            # 默认排序引擎规则:站点优先级 + 做种数降序
-            con.execute("update systemconfig set value=? where key='TorrentsPriority'",
-                        ('["site","seeder"]',))
-            con.commit()
-            con.close()
-            logger.info("%s 搜索优选已生效:站点优先级重排 %d 条 + 排序规则[site,seeder]", self.plugin_name, len(items))
-        except Exception as err:
-            logger.error("%s 搜索优选重排失败:%s", self.plugin_name, err)
-
-    def _restore_search_priority(self):
-        """关闭搜索优选时还原备份的原站点优先级与排序规则。"""
+    def _cleanup_sort_experiment(self):
+        """排序实验回滚:还原 site.pri 与 TorrentsPriority,并清理残留的流式补丁。"""
+        import json as _json
         backup_file = Path("/config/keepaliveplus_pri_backup.json")
-        if not backup_file.exists():
-            return
         try:
-            import json as _json
-            data = _json.loads(backup_file.read_text(encoding="utf-8"))
-            pri_map = data.get("site_pri") or data
-            con = sqlite3.connect("/config/user.db", timeout=15)
-            for sid, pri in pri_map.items():
-                con.execute("update site set pri=? where id=?", (int(pri), int(sid)))
-            tp = data.get("torrents_priority")
-            if tp:
-                con.execute("update systemconfig set value=? where key='TorrentsPriority'", (tp,))
-            con.commit()
-            con.close()
-            backup_file.unlink()
-            logger.info("%s 已还原原站点优先级与排序规则(%d 站)", self.plugin_name, len(pri_map))
+            if backup_file.exists():
+                data = _json.loads(backup_file.read_text(encoding="utf-8"))
+                pri_map = data.get("site_pri") or data
+                con = sqlite3.connect("/config/user.db", timeout=15)
+                for sid, pri in pri_map.items():
+                    con.execute("update site set pri=? where id=?", (int(pri), int(sid)))
+                tp = data.get("torrents_priority")
+                if tp:
+                    con.execute("update systemconfig set value=? where key='TorrentsPriority'", (tp,))
+                con.commit()
+                con.close()
+                backup_file.unlink()
+                logger.info("%s 排序实验已回滚:站点优先级与排序规则已还原(%d 站)", self.plugin_name, len(pri_map))
         except Exception as err:
-            logger.error("%s 还原站点优先级失败:%s", self.plugin_name, err)
+            logger.warning("%s 排序实验回滚失败(不影响保号功能):%s", self.plugin_name, err)
+        try:
+            from app.chain.search.provider import SearchProviderOwner
+            f = getattr(SearchProviderOwner, "_iter_torrent_events", None)
+            if f is not None and getattr(f, "_kap_sorted", False):
+                orig = None
+                for cell in (f.__closure__ or ()):
+                    try:
+                        c = cell.cell_contents
+                    except ValueError:
+                        continue
+                    if callable(c) and getattr(c, "__name__", "") == "_iter_torrent_events":
+                        orig = c
+                        break
+                if orig is not None:
+                    setattr(SearchProviderOwner, "_iter_torrent_events", orig)
+                    logger.info("%s 残留流式补丁已卸载,搜索事件流已还原", self.plugin_name)
+        except Exception as err:
+            logger.warning("%s 残留流式补丁清理失败(不影响保号功能):%s", self.plugin_name, err)
 
     def _rows(self) -> List[Dict[str, Any]]:
         if not self._has_calculated:
