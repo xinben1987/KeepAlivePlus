@@ -711,14 +711,25 @@ class KeepAlivePlus(_PluginBase):
                 pass
 
     def _download_gap_gb(self, lv: Optional[Dict[str, Any]], row: Dict[str, Any]) -> float:
-        """到永久档的下载量缺口(GB)；无下载要求或已达标返回 0。"""
+        """到永久档的下载量缺口(GB)；无下载要求或已达标返回 0。
+
+        alternative(二选一)结构时取"下载路径"的缺口作为参考值。
+        """
         if lv is None:
             return 0.0
-        need = self._size_gb(lv.get("downloaded"))
+        need = None
+        alts = lv.get("alternative") or []
+        for alt in alts:
+            if alt.get("downloaded") is not None:
+                need = alt.get("downloaded")
+                break
         if need is None:
+            need = lv.get("downloaded")
+        need_gb = self._size_gb(need)
+        if need_gb is None:
             return 0.0
         cur = (row.get("download") or 0) / (1 << 30)
-        return max(0.0, need - cur)
+        return max(0.0, need_gb - cur)
 
     def _apply_search_priority(self):
         """搜索优选：按下载缺口升序重排 site.pri(数字小=搜索结果靠前)。
