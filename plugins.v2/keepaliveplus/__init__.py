@@ -326,7 +326,9 @@ class KeepAlivePlus(_PluginBase):
                         return True
                 return False
 
-            return [dict(r) for r in rows if _matched(r.get("domain") or "")]
+            # sqlite3.Row 没有 .get，先转 dict 再过滤
+            items = [dict(r) for r in rows]
+            return [r for r in items if _matched(r.get("domain") or "")]
         except Exception as err:
             logger.error("%s 读取站点快照失败：%s", self.plugin_name, err)
             return []
