@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.9"
+    plugin_version = "0.1.10"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -428,33 +428,53 @@ class KeepAlivePlus(_PluginBase):
         factor = {"T": 1024.0, "G": 1.0, "M": 1 / 1024.0, "K": 1 / (1024 * 1024), "": 1.0}.get(m.group(2))
         return v * factor if factor else None
 
+    def _field_gap(self, key: str, need, row: Dict[str, Any]) -> Optional[str]:
+        """单个条件字段的差距描述；已达标或无法比较返回 None。"""
+        if need is None:
+            return None
+        try:
+            if key == "ratio":
+                diff = float(need) - float(row.get("ratio") or 0)
+                return ("分享率还差%.2f" % diff) if diff > 0 else None
+            if key in ("downloaded", "uploaded"):
+                need_gb = self._size_gb(need)
+                if need_gb is None:
+                    return None
+                label = "下载" if key == "downloaded" else "上传"
+                diff = need_gb - (row.get(key) or 0) / (1 << 30)
+                if diff <= 0.5:
+                    return None
+                if diff >= 1024:
+                    return "%s还差%.1fTB" % (label, diff / 1024)
+                return "%s还差%.0fGB" % (label, diff)
+            if key == "bonus":
+                diff = float(need) - float(row.get("bonus") or 0)
+                return ("魔力还差%.0f" % diff) if diff > 0 else None
+        except (TypeError, ValueError):
+            return None
+        # 快照无对应数据的字段，只能列门槛
+        if key == "uploads":
+            return "发种%d个(快照无发种数据)" % int(need)
+        if key == "snatches":
+            return "完成%d个(快照无数据)" % int(need)
+        if key == "seedingBonus":
+            return "做种积分≥%s(快照无数据)" % need
+        if key == "seedingTime":
+            return "做种%s(快照无数据)" % need
+        return None
+
     def _gap_text(self, lv: Dict[str, Any], row: Dict[str, Any]) -> str:
-        """按快照数据计算到豁免等级的“实际差距”，无法计算的项不列。"""
-        gaps = []
-        if lv.get("ratio") is not None:
-            try:
-                diff = float(lv["ratio"]) - float(row.get("ratio") or 0)
-                if diff > 0:
-                    gaps.append("分享率还差%.2f" % diff)
-            except (TypeError, ValueError):
-                pass
-        need_dl = self._size_gb(lv.get("downloaded"))
-        if need_dl is not None:
-            diff = need_dl - (row.get("download") or 0) / (1 << 30)
-            if diff > 0.5:
-                gaps.append(("下载还差%.1fTB" % (diff / 1024)) if diff >= 1024 else ("下载还差%.0fGB" % diff))
-        need_ul = self._size_gb(lv.get("uploaded"))
-        if need_ul is not None:
-            diff = need_ul - (row.get("upload") or 0) / (1 << 30)
-            if diff > 0.5:
-                gaps.append(("上传还差%.1fTB" % (diff / 1024)) if diff >= 1024 else ("上传还差%.0fGB" % diff))
-        if lv.get("bonus") is not None:
-            try:
-                diff = float(lv["bonus"]) - float(row.get("bonus") or 0)
-                if diff > 0:
-                    gaps.append(("魔力还差%.0f" % diff) if diff >= 1 else "魔力已达标")
-            except (TypeError, ValueError):
-                pass
+        """按快照数据计算到豁免等级的“实际差距”，支持 alternative(二选一)。"""
+        alts = lv.get("alternative") or []
+        if alts:
+            parts = []
+            for alt in alts:
+                sub = [g for g in (self._field_gap(k, v, row) for k, v in alt.items()) if g]
+                parts.append("、".join(sub) if sub else "已达标")
+            if any(p == "已达标" for p in parts):
+                return ""  # 二选一里已有满足的路径
+            return "满足其一:" + " 或 ".join(parts)
+        gaps = [g for g in (self._field_gap(k, lv.get(k), row) for k in ("ratio", "downloaded", "uploaded", "bonus")) if g]
         m = re.match(r"P(\d+)([WDMY])", str(lv.get("interval") or ""))
         join_at = str(row.get("join_at") or "")
         if m and join_at:
@@ -524,6 +544,28 @@ class KeepAlivePlus(_PluginBase):
             parts.append("发种≥%s个" % lv["uploads"])
         if lv.get("snatches"):
             parts.append("完成≥%s个" % lv["snatches"])
+        alts = lv.get("alternative") or []
+        if alts:
+            alt_strs = []
+            for alt in alts:
+                seg = []
+                for k, v in alt.items():
+                    if k == "downloaded":
+                        seg.append("下载≥%s" % v)
+                    elif k == "uploaded":
+                        seg.append("上传≥%s" % v)
+                    elif k == "uploads":
+                        seg.append("发种≥%s个" % v)
+                    elif k == "ratio":
+                        seg.append("分享率≥%s" % v)
+                    elif k == "seedingBonus":
+                        seg.append("做种积分≥%s" % v)
+                    elif k == "snatches":
+                        seg.append("完成≥%s个" % v)
+                    else:
+                        seg.append("%s≥%s" % (k, v))
+                alt_strs.append("+".join(seg))
+            parts.append("满足其一:" + " 或 ".join(alt_strs))
         return "、".join(parts)
 
     def _recalculate(self, trigger: str = "内部调用"):
@@ -577,9 +619,10 @@ class KeepAlivePlus(_PluginBase):
                     if risk_txt:
                         note += "。⚠️ " + risk_txt
                 elif perm_lv is not None and cur_id >= tgt_id:
-                    status, note = "✅ 已保号", "已达无条件永久保留档「%s」" % tgt_name
-                    # 无条件永久保留 = 不活跃删除/禁用红线不适用；仅"全员冻结/禁用型"(春天/北洋园)例外
+                    status, note = "✅ 已保号", "已达永久保留档「%s」:账号永不删号" % tgt_name
+                    # 全员冻结/禁用型(春天/北洋园):不删号但会被冻结/禁用,该红线仍适用
                     if rule.get("risk_applies_to_permanent") and risk_txt:
+                        note += ";但不活跃仍会被" + (rule.get("risk_action") or "处置")
                         note += "。⚠️ " + risk_txt
                 elif perm_lv is None and cur_id >= tgt_id:
                     status = "✅ 已达标（封存型）"
