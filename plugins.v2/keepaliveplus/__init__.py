@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.12"
+    plugin_version = "0.2.0"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -51,6 +51,7 @@ class KeepAlivePlus(_PluginBase):
     _onlyonce = False
     _daily = True
     _monthly = True
+    _search_boost = False
     _cron = ""
     _donor_sites: List[str] = []
     _scheduler: Optional[BackgroundScheduler] = None
@@ -87,6 +88,7 @@ class KeepAlivePlus(_PluginBase):
         self._onlyonce = bool(config.get("onlyonce", False))
         self._daily = bool(config.get("daily_refresh", True))
         self._monthly = bool(config.get("monthly_refresh", True))
+        self._search_boost = bool(config.get("search_boost", False))
         self._cron = str(config.get("cron") or "").strip()
         donor = config.get("donor_sites") or []
         self._donor_sites = [str(s).strip() for s in (donor if isinstance(donor, list) else str(donor).split(",")) if str(s).strip()]
@@ -96,6 +98,11 @@ class KeepAlivePlus(_PluginBase):
             self._onlyonce = False
             self.__save_config()
         self._setup_scheduler()
+        # 搜索优选:开启时按下载缺口重排站点优先级,关闭时还原原优先级
+        if self._search_boost:
+            self._apply_search_priority()
+        else:
+            self._restore_search_priority()
 
     def __save_config(self):
         self.update_config({
@@ -103,6 +110,7 @@ class KeepAlivePlus(_PluginBase):
             "onlyonce": self._onlyonce,
             "daily_refresh": self._daily,
             "monthly_refresh": self._monthly,
+            "search_boost": self._search_boost,
             "cron": self._cron,
             "donor_sites": ",".join(self._donor_sites) if isinstance(self._donor_sites, list) else str(self._donor_sites or ""),
         })
@@ -156,7 +164,20 @@ class KeepAlivePlus(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "search_boost",
+                                            "label": "搜索优选(按下载缺口重排站点优先级)",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -169,7 +190,7 @@ class KeepAlivePlus(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -624,6 +645,7 @@ class KeepAlivePlus(_PluginBase):
             tgt_lv = perm_lv if perm_lv is not None else seal_lv
             ratio_txt = self._ratio_text(tgt_lv, r)
             risk_txt = self._risk_text(rule, r)
+            gap_gb = self._download_gap_gb(tgt_lv, r) if tgt_lv is not None else 0.0
             gap_txt = "—"
             if donor:
                 status = "✅ 已保号"
@@ -663,6 +685,7 @@ class KeepAlivePlus(_PluginBase):
                 "site": site_name, "domain": domain,
                 "user_level": user_level or "无快照",
                 "status": status, "ratio": ratio_txt, "gap": gap_txt, "risk": risk_txt,
+                "gap_gb": round(gap_gb, 1),
                 "updated": r.get("updated_time"),
                 "err_msg": r.get("err_msg"),
                 "donor": donor,
@@ -670,6 +693,9 @@ class KeepAlivePlus(_PluginBase):
         self._cached_rows = out
         self._has_calculated = True
         logger.info("%s 保号状态重算完成（触发=%s，站点数=%d）", self.plugin_name, trigger, len(out))
+        # 搜索优选：按最新缺口重排站点搜索优先级
+        if self._search_boost:
+            self._apply_search_priority()
         # 刷新异常提示：等级缺失 / 快照报错（err_msg）的站点
         bad = []
         for o in out:
@@ -683,6 +709,89 @@ class KeepAlivePlus(_PluginBase):
                                   text="以下站点快照异常：%s。请检查对应站点 Cookie/登录状态。" % "、".join(bad))
             except Exception:
                 pass
+
+    def _download_gap_gb(self, lv: Optional[Dict[str, Any]], row: Dict[str, Any]) -> float:
+        """到永久档的下载量缺口(GB)；无下载要求或已达标返回 0。"""
+        if lv is None:
+            return 0.0
+        need = self._size_gb(lv.get("downloaded"))
+        if need is None:
+            return 0.0
+        cur = (row.get("download") or 0) / (1 << 30)
+        return max(0.0, need - cur)
+
+    def _apply_search_priority(self):
+        """搜索优选：按下载缺口升序重排 site.pri(数字小=搜索结果靠前)。
+
+        首次启用时把原 pri 备份到 /config/keepaliveplus_pri_backup.json，
+        关闭功能时由 _restore_search_priority 还原。
+        """
+        if not self._has_calculated:
+            self._recalculate("搜索优选前置计算")
+        try:
+            import json as _json
+            backup_file = Path("/config/keepaliveplus_pri_backup.json")
+            con = sqlite3.connect("/config/user.db", timeout=15)
+            con.row_factory = sqlite3.Row
+            if not backup_file.exists():
+                backup = {str(r["id"]): (r["pri"] or 0) for r in con.execute("select id, pri from site")}
+                backup_file.write_text(_json.dumps(backup, ensure_ascii=False), encoding="utf-8")
+                logger.info("%s 已备份原站点搜索优先级(%d 站)", self.plugin_name, len(backup))
+            # 域名 -> site id 映射（与快照同源的尾部匹配）
+            def _norm(d):
+                d = (d or "").lower().strip()
+                return d[4:] if d.startswith("www.") else d
+
+            site_map = {}
+            for s in con.execute("select id, url from site"):
+                u = _norm(s["url"] or "")
+                if "//" in u:
+                    u = u.split("//", 1)[1]
+                u = u.split("/", 1)[0].strip()
+                if u:
+                    site_map[u] = s["id"]
+
+            def _match_id(dom):
+                d = _norm(dom)
+                for u, sid in site_map.items():
+                    if d == u or d.endswith("." + u) or u.endswith("." + d):
+                        return sid
+                return None
+
+            # 排序：缺口升序(缺得少的最优先)，缺口 0(已保号/无要求)排后
+            items = []
+            for o in self._cached_rows:
+                sid = _match_id(o.get("domain") or "")
+                if sid is not None:
+                    items.append((sid, float(o.get("gap_gb") or 0)))
+            items.sort(key=lambda x: (x[1], x[0]))
+            pri = 0
+            for sid, _ in items:
+                pri += 1
+                con.execute("update site set pri=? where id=?", (pri, sid))
+            con.commit()
+            con.close()
+            logger.info("%s 搜索优选已重排站点优先级(共 %d 站,按下载缺口升序)", self.plugin_name, len(items))
+        except Exception as err:
+            logger.error("%s 搜索优选重排失败：%s", self.plugin_name, err)
+
+    def _restore_search_priority(self):
+        """关闭搜索优选时还原备份的原站点优先级。"""
+        backup_file = Path("/config/keepaliveplus_pri_backup.json")
+        if not backup_file.exists():
+            return
+        try:
+            import json as _json
+            backup = _json.loads(backup_file.read_text(encoding="utf-8"))
+            con = sqlite3.connect("/config/user.db", timeout=15)
+            for sid, pri in backup.items():
+                con.execute("update site set pri=? where id=?", (int(pri), int(sid)))
+            con.commit()
+            con.close()
+            backup_file.unlink()
+            logger.info("%s 已还原原站点搜索优先级(%d 站)", self.plugin_name, len(backup))
+        except Exception as err:
+            logger.error("%s 还原站点优先级失败：%s", self.plugin_name, err)
 
     def _rows(self) -> List[Dict[str, Any]]:
         if not self._has_calculated:
