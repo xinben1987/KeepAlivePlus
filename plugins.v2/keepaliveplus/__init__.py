@@ -760,20 +760,22 @@ class KeepAlivePlus(_PluginBase):
                     u = u.split("//", 1)[1]
                 u = u.split("/", 1)[0].strip()
                 if u:
-                    site_map[u] = s["id"]
+                    # 同一域名可能有多条站点记录（重复添加），全部收集
+                    site_map.setdefault(u, []).append(s["id"])
 
-            def _match_id(dom):
+            def _match_ids(dom):
                 d = _norm(dom)
-                for u, sid in site_map.items():
+                ids = []
+                for u, sids in site_map.items():
                     if d == u or d.endswith("." + u) or u.endswith("." + d):
-                        return sid
-                return None
+                        ids.extend(sids)
+                return ids
 
             # 排序：缺口升序(缺得少的最优先)，缺口 0(已保号/无要求)排后
             items = []
             for o in self._cached_rows:
-                sid = _match_id(o.get("domain") or "")
-                if sid is not None:
+                ids = _match_ids(o.get("domain") or "")
+                for sid in ids:
                     items.append((sid, float(o.get("gap_gb") or 0)))
             items.sort(key=lambda x: (x[1], x[0]))
             pri = 0
@@ -782,7 +784,7 @@ class KeepAlivePlus(_PluginBase):
                 con.execute("update site set pri=? where id=?", (pri, sid))
             con.commit()
             con.close()
-            logger.info("%s 搜索优选已重排站点优先级(共 %d 站,按下载缺口升序)", self.plugin_name, len(items))
+            logger.info("%s 搜索优选已重排站点优先级(共 %d 条,按下载缺口升序)", self.plugin_name, len(items))
         except Exception as err:
             logger.error("%s 搜索优选重排失败：%s", self.plugin_name, err)
 
