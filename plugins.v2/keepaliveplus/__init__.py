@@ -40,7 +40,7 @@ class KeepAlivePlus(_PluginBase):
     plugin_name = "保号状态增强"
     plugin_desc = "基于站点快照与规则库，切实显示全部站点保号状态（无无法判断）。"
     plugin_icon = "database.png"
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.2"
     plugin_author = "leon"
     author_url = ""
     plugin_config_prefix = "keepaliveplus_"
@@ -277,93 +277,39 @@ class KeepAlivePlus(_PluginBase):
     def get_page(self) -> List[dict]:
         """返回保号状态详情页（全站表格）。"""
         rows = sorted(self._rows(), key=lambda r: r.get("site") or "")
-        headers = [
-            ("站点", "8fr"), ("当前等级", "10fr"), ("保号状态", "12fr"),
-            ("保号豁免等级", "12fr"), ("说明", "26fr"), ("数据时间", "10fr"),
-        ]
-        table_rows = []
-        for r in rows:
-            cells = [
-                self.__cell(r.get("site") or r.get("domain"), headers[0][1]),
-                self.__cell(r.get("user_level"), headers[1][1]),
-                self.__cell(r.get("status"), headers[2][1]),
-                self.__cell(r.get("retention_level"), headers[3][1]),
-                self.__cell(r.get("note"), headers[4][1]),
-                self.__cell(r.get("updated"), headers[5][1]),
-            ]
-            table_rows.append({
+        headers = ["站点", "当前等级", "保号状态", "保号豁免等级", "说明", "数据时间"]
+        total = len(rows)
+        ok_cnt = sum(1 for r in rows if "已保号" in (r.get("status") or ""))
+        login_cnt = total - ok_cnt
+        summary_text = f"共 {total} 站：\u2705 已保号 {ok_cnt} 站 | \u2139 登录保号 {login_cnt} 站"
+        thead = {
+            "component": "thead",
+            "content": [{
                 "component": "tr",
-                "content": [{
-                    "component": "td",
-                    "props": {"colspan": len(headers), "class": "pa-0"},
-                    "content": [{
-                        "component": "VCard",
-                        "props": {"variant": "flat", "class": "w-100 rounded-0"},
-                        "content": [{
-                            "component": "VRow",
-                            "content": [{
-                                "component": "VCol",
-                                "props": {"cols": 12 - i * 2, "class": "pa-2 text-wrap"},
-                                "content": [{"component": "span", "props": {"text": str(c)}}],
-                            } for i, c in enumerate(cells)],
-                        }],
-                    }],
-                }],
-            })
-        header_row = {
-            "component": "tr",
-            "content": [{"component": "th", "props": {"text": h, "class": "text-start"}} for h, _ in headers],
+                "content": [{"component": "th", "props": {"class": "text-start"}, "text": h} for h in headers],
+            }],
         }
-        return [{
+        trs = []
+        for r in rows:
+            trs.append({
+                "component": "tr",
+                "content": [
+                    {"component": "td", "props": {"class": "text-sm"}, "text": str(r.get(k) or "")}
+                    for k in ("site", "user_level", "status", "retention_level", "note", "updated")
+                ],
+            })
+        vtable = {
             "component": "VTable",
             "props": {"class": "w-100"},
-            "content": [
-                {"component": "thead", "content": [header_row]},
-                {"component": "tbody", "content": table_rows},
-            ],
-        }]
-
-    @staticmethod
-    def __cell(text, width: str) -> Dict[str, Any]:
-        return {"component": "span", "props": {"text": str(text or "")}, "width": width}
-
-    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        donor_text = ", ".join(self._donor_sites)
+            "content": [thead, {"component": "tbody", "content": trs}],
+        }
         return [
-            {
-                "component": "VForm",
-                "content": [
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}},
-                        ]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "onlyonce", "label": "立即运行一次"}},
-                        ]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "cron", "label": "重算周期（cron，留空不建定时）"}},
-                        ]},
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VTextField",
-                             "props": {"model": "donor_sites_text", "label": "捐赠/黄星站点（逗号分隔站名）",
-                                       "placeholder": "例：馒头,猫站"}},
-                        ]},
-                        {"component": "VCol", "props": {"cols": 12}, "content": [
-                            {"component": "VAlert", "props": {
-                                "type": "info",
-                                "text": "判定优先级：捐赠/黄星站点 > 规则豁免等级 > 无规则登录保号。"
-                                        "规则库复用 PTDepilerMp 的 site_rules（需已安装该插件）。",
-                            }},
-                        ]},
-                    ]},
-                ],
-            },
-            {
-                "enabled": self._enabled,
-                "onlyonce": self._onlyonce,
-                "cron": self._cron,
-                "donor_sites_text": donor_text,
-            },
+            {"component": "VRow", "content": [
+                {"component": "VCol", "props": {"cols": 12}, "content": [
+                    {"component": "VAlert", "props": {"type": "success", "variant": "tonal"}, "text": summary_text},
+                ]},
+                {"component": "VCol", "props": {"cols": 12}, "content": [vtable]},
+            ]},
         ]
 
     def get_page_data(self):
